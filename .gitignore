@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+/dist/
+
+# Electron builder temporary/icon artifacts
+/dist/.icon-icns/
+/dist/.icon-ico/
+
+# Downloaded upstream release archives
+CLIProxyAPIPlus_*.tar.gz
+CLIProxyAPIPlus_*.zip
+
+# Local logs
+*.log
+
+# macOS
+.DS_Store

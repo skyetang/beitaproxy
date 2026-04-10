@@ -1,0 +1,394 @@
+const LANGUAGE_STORAGE_KEY = 'beitaproxy-language';
+
+const TRANSLATIONS = {
+  zh: {
+    static: {
+      title: 'BeitaProxy',
+      serverStatus: '服务状态',
+      dashboard: 'Dashboard',
+      openDashboard: '打开',
+      language: '语言',
+      launchAtLogin: '开机启动',
+      authFiles: '认证文件',
+      openFolder: '打开文件夹',
+      localProxy: '本地代理',
+      services: '服务',
+      navServer: '服务状态',
+      navSettings: '基础设置',
+      navServices: '服务账号',
+      navAbout: '关于',
+      settingsPanel: '基础设置',
+      aboutPanel: '关于',
+      cancel: '取消',
+      continue: '继续',
+      ok: '确定',
+      delete: '删除',
+      footerLine1: '<a href="https://github.com/router-for-me/CLIProxyAPIPlus" target="_blank">BeitaProxy 0.1 版本，基于 CLIProxyAPIPlus 构建</a>',
+      footerLine2: '',
+      footerLine3: ''
+    },
+    common: {
+      unknown: '未知',
+      success: '成功',
+      error: '错误',
+      save: '保存',
+      set: '设置',
+      edit: '编辑',
+      clear: '清除',
+      running: '运行中',
+      stopped: '未启动',
+      disabled: '已停用',
+      yes: '是',
+      no: '否',
+      available: '可用',
+      blocked: '已阻止',
+      refresh: '刷新',
+      confirm: '确认'
+    },
+    services: {
+      addAccount: '添加账号',
+      connectedAccounts: ({ count }) => `${count} 个已连接账号`,
+      roundRobin: '轮询 + 自动故障切换',
+      enable: '启用',
+      disable: '停用',
+      remove: '删除',
+      noAccounts: '暂无已连接账号',
+      noAccountsAdded: '还没有添加任何账号，请先点击右上角添加账号。',
+      chooseProviderTitle: '选择渠道',
+      chooseProviderDescription: '请选择要添加账号的渠道',
+      chooseMethodTitle: ({ serviceName }) => `选择 ${serviceName} 的添加方式`,
+      chooseMethodDescription: '请选择该渠道的认证或导入方式',
+      webAuth: '网页认证',
+      localImport: '本地导入',
+      importFromIde: '从 IDE 导入',
+      syncFromIde: '从 IDE 同步',
+      expired: '已过期',
+      disabledAccount: '已停用',
+      accountEnabled: '账号已启用。',
+      accountDisabled: '账号已停用。',
+      lastEnabledAccount: '至少要保留一个已启用账号。',
+      toggleFailed: '更新账号状态失败。'
+    },
+    proxy: {
+      notSet: '未设置',
+      title: '本地代理',
+      description: '输入本地代理地址，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080',
+      saveFailedTitle: '代理设置失败',
+      saveFailedMessage: '保存本地代理失败。',
+      savedTitle: '代理已保存',
+      savedWithProxy: ({ proxyUrl }) => `本地代理已保存：\n\n${proxyUrl}\n\n后续服务请求会通过这个代理发送。`,
+      savedWithoutProxy: '本地代理已清除，后续请求将使用直连或系统代理设置。',
+      clearedTitle: '代理已清除',
+      clearedMessage: '本地代理已清除。'
+    },
+    codex: {
+      selectFailed: '切换失败',
+      selectFailedMessage: '切换 Codex 账号失败。',
+      authTitle: 'Codex 认证',
+      authPrompt: ({ path }) => `请选择认证方式：\n\n• 网页认证\n• 从本地 Codex 登录导入\n\n当前检测路径：${path}`,
+      webAuth: '网页认证',
+      importLocal: '从本地导入',
+      importSuccess: '导入成功',
+      importFailed: '导入失败',
+      authInProgress: '已有一个 Codex 登录流程正在进行中。\n\n如果你刚刚关闭了浏览器页面，请稍等片刻后再试。',
+      localAuthMissing: ({ path }) => `未找到可导入的本地 Codex 登录信息。\n\n检测路径：${path}`,
+      importMessage: ({ action, email }) => `已从本地登录${action} Codex 账号。\n\n账号：${email}`,
+      importActionUpdated: '更新',
+      importActionImported: '导入'
+    },
+    kiro: {
+      serverNotRunningTitle: '服务未启动',
+      serverNotRunningMessage: '请先启动服务，再进行 Kiro 认证。',
+      authTitle: 'Kiro 认证',
+      authPrompt: '请选择认证方式：\n\n• 网页认证 (Google OAuth / AWS Builder ID)\n• 从 Kiro IDE 导入令牌\n• 从 IDE 同步已有令牌',
+      authPromptImportOnly: '请选择认证方式：\n\n• 网页认证 (Google OAuth / AWS Builder ID)\n• 从 Kiro IDE 导入令牌',
+      authOpened: '已在浏览器打开 Kiro 认证。\n\n你可以：\n• 使用 Google OAuth 登录\n• 使用 AWS Builder ID 登录\n\n应用会自动检测你的凭证。',
+      syncFailed: '同步失败',
+      importFailed: '导入失败',
+      syncSuccess: ({ count }) => `已从 IDE 同步 ${count} 个 Kiro 令牌。\n\n令牌已更新为最新凭证。`,
+      importSuccess: '已从 Kiro IDE 成功导入令牌。',
+      syncFromIde: '从 IDE 同步',
+      importFromIde: '从 IDE 导入'
+    },
+    auth: {
+      started: '认证已开始',
+      completed: '认证成功',
+      failed: '认证失败',
+      failedMessage: ({ details }) => `请检查本地回调页面和浏览器登录流程。\n\n详情：${details}`,
+      genericPending: '已在浏览器中打开认证流程，请先完成登录。',
+      pendingAntigravity: '已在浏览器打开 Antigravity 认证，请完成登录。',
+      pendingClaude: '已在浏览器打开 Claude Code 认证，请完成登录。',
+      pendingCodex: '已在浏览器打开 Codex 认证，请完成登录。',
+      pendingGemini: '已在浏览器打开 Gemini 认证，请完成登录。',
+      pendingGithubCopilot: 'GitHub Copilot 认证已开始，请在浏览器中完成设备码登录。',
+      pendingQwen: '已在浏览器打开 Qwen 认证，请完成登录。',
+      genericCompleted: '认证完成，已检测到本地凭证。',
+      antigravity: 'Antigravity 认证完成，已检测到本地凭证。',
+      claude: 'Claude Code 认证完成，已检测到本地凭证。',
+      codex: 'Codex 认证完成，已检测到本地凭证。',
+      gemini: 'Gemini 认证完成，已检测到本地凭证。',
+      githubCopilot: 'GitHub Copilot 认证完成，已检测到本地凭证。',
+      qwen: 'Qwen 认证完成，已检测到本地凭证。'
+    },
+    qwen: {
+      title: 'Qwen 账号邮箱',
+      description: '请输入你的 Qwen 账号邮箱',
+      placeholder: 'your.email@example.com'
+    },
+    zai: {
+      title: 'Z.AI API Key',
+      description: '请输入你的 Z.AI API Key（z.ai/manage-apikey/apikey-list）',
+      addKey: '添加密钥',
+      success: 'Z.AI API Key 已添加成功。\n\n现在可以通过代理使用 GLM 模型了。'
+    },
+    remove: {
+      title: '删除账号',
+      confirm: ({ email, serviceName }) => `确认从 ${serviceName} 删除 ${email} 吗？`,
+      removedTitle: '已删除',
+      removedMessage: ({ email }) => `已删除 ${email}`,
+      failed: '删除账号失败'
+    },
+    usage: {
+      query: '查询用量',
+      refresh: '刷新用量',
+      querying: '正在查询当前用量...',
+      failed: '查询用量失败。',
+      overview: 'Codex 用量概览',
+      expand: '展开',
+      collapse: '折叠',
+      updatedAt: '查询时间',
+      plan: '套餐',
+      status: '状态',
+      limitReached: '已触顶',
+      used: '已用',
+      remaining: '剩余',
+      cycle: '周期',
+      resetAt: '重置时间',
+      timeLeft: '距离重置',
+      periodStart: '周期开始',
+      windowLength: '窗口长度',
+      codeReview: '代码审查',
+      codeReviewStatus: '代码审查状态',
+      reviewUsed: '代码审查已用',
+      reviewResetAt: '代码审查重置时间',
+      window5h: '5H 窗口',
+      window5hRemaining: '5H 剩余',
+      windowWeek: '一周窗口',
+      windowWeekRemaining: '一周剩余',
+      primaryWindow: '主窗口',
+      secondaryWindow: '次窗口',
+      subtitleFallback: '点击展开查看详细用量',
+      subtitleUpdated: ({ value }) => `上次查询：${value}`,
+      noData: '接口未返回可展示的用量数据。'
+    }
+  },
+  en: {
+    static: {
+      title: 'BeitaProxy',
+      serverStatus: 'Server Status',
+      dashboard: 'Dashboard',
+      openDashboard: 'Open',
+      language: 'Language',
+      launchAtLogin: 'Launch at Login',
+      authFiles: 'Auth Files',
+      openFolder: 'Open Folder',
+      localProxy: 'Local Proxy',
+      services: 'Services',
+      navServer: 'Server Status',
+      navSettings: 'Settings',
+      navServices: 'Service Accounts',
+      navAbout: 'About',
+      settingsPanel: 'Settings',
+      aboutPanel: 'About',
+      cancel: 'Cancel',
+      continue: 'Continue',
+      ok: 'OK',
+      delete: 'Delete',
+      footerLine1: '<a href="https://github.com/router-for-me/CLIProxyAPIPlus" target="_blank">BeitaProxy 0.1, built on CLIProxyAPIPlus</a>',
+      footerLine2: '',
+      footerLine3: ''
+    },
+    common: {
+      unknown: 'Unknown',
+      success: 'Success',
+      error: 'Error',
+      save: 'Save',
+      set: 'Set',
+      edit: 'Edit',
+      clear: 'Clear',
+      running: 'Running',
+      stopped: 'Stopped',
+      disabled: 'Disabled',
+      yes: 'Yes',
+      no: 'No',
+      available: 'Available',
+      blocked: 'Blocked',
+      refresh: 'Refresh',
+      confirm: 'Confirm'
+    },
+    services: {
+      addAccount: 'Add Account',
+      connectedAccounts: ({ count }) => `${count} connected account${count === 1 ? '' : 's'}`,
+      roundRobin: 'Round-robin with auto-failover',
+      enable: 'Enable',
+      disable: 'Disable',
+      remove: 'Remove',
+      noAccounts: 'No connected accounts',
+      noAccountsAdded: 'No accounts yet. Use the Add Account button in the top-right to get started.',
+      chooseProviderTitle: 'Choose Provider',
+      chooseProviderDescription: 'Select a provider to add an account for',
+      chooseMethodTitle: ({ serviceName }) => `Choose how to add ${serviceName}`,
+      chooseMethodDescription: 'Select the authentication or import method for this provider',
+      webAuth: 'Web Authentication',
+      localImport: 'Import from Local',
+      importFromIde: 'Import from IDE',
+      syncFromIde: 'Sync from IDE',
+      expired: 'expired',
+      disabledAccount: 'disabled',
+      accountEnabled: 'Account enabled.',
+      accountDisabled: 'Account disabled.',
+      lastEnabledAccount: 'At least one account must remain enabled.',
+      toggleFailed: 'Failed to update account state.'
+    },
+    proxy: {
+      notSet: 'Not set',
+      title: 'Local Proxy',
+      description: 'Enter a local proxy URL, for example http://127.0.0.1:7890 or socks5://127.0.0.1:1080',
+      saveFailedTitle: 'Proxy Failed',
+      saveFailedMessage: 'Failed to save local proxy.',
+      savedTitle: 'Proxy Saved',
+      savedWithProxy: ({ proxyUrl }) => `Local proxy saved:\n\n${proxyUrl}\n\nServer requests will now use this proxy.`,
+      savedWithoutProxy: 'Local proxy cleared. Requests will now use direct or system proxy settings.',
+      clearedTitle: 'Proxy Cleared',
+      clearedMessage: 'Local proxy has been cleared.'
+    },
+    codex: {
+      selectFailed: 'Selection Failed',
+      selectFailedMessage: 'Failed to switch Codex account.',
+      authTitle: 'Codex Authentication',
+      authPrompt: ({ path }) => `Choose authentication method:\n\n• Web Authentication\n• Import from local Codex login\n\nDetected path: ${path}`,
+      webAuth: 'Web Auth',
+      importLocal: 'Import from Local',
+      importSuccess: 'Import Successful',
+      importFailed: 'Import Failed',
+      authInProgress: 'A Codex authentication flow is already running.\n\nIf you just closed the browser page, wait a moment and try again.',
+      localAuthMissing: ({ path }) => `No importable local Codex login was found.\n\nChecked path: ${path}`,
+      importMessage: ({ action, email }) => `Codex account ${action} from local login.\n\nAccount: ${email}`,
+      importActionUpdated: 'updated',
+      importActionImported: 'imported'
+    },
+    kiro: {
+      serverNotRunningTitle: 'Server Not Running',
+      serverNotRunningMessage: 'Please start the server first to authenticate with Kiro.',
+      authTitle: 'Kiro Authentication',
+      authPrompt: 'Choose authentication method:\n\n• Web Authentication (Google OAuth / AWS Builder ID)\n• Import from Kiro IDE\n• Sync existing token from IDE',
+      authPromptImportOnly: 'Choose authentication method:\n\n• Web Authentication (Google OAuth / AWS Builder ID)\n• Import from Kiro IDE',
+      authOpened: 'Browser opened for Kiro authentication.\n\nYou can:\n• Login with Google OAuth\n• Login with AWS Builder ID\n\nThe app will automatically detect your credentials.',
+      syncFailed: 'Sync Failed',
+      importFailed: 'Import Failed',
+      syncSuccess: ({ count }) => `Synced ${count} Kiro token(s) from IDE.\n\nTokens have been updated with the latest credentials.`,
+      importSuccess: 'Kiro token imported from Kiro IDE successfully.',
+      syncFromIde: 'Sync from IDE',
+      importFromIde: 'Import from IDE'
+    },
+    auth: {
+      started: 'Authentication Started',
+      completed: 'Authentication Complete',
+      failed: 'Authentication Failed',
+      failedMessage: ({ details }) => `Please check the local callback page and finish the browser login flow.\n\nDetails: ${details}`,
+      genericPending: 'Browser opened for authentication. Please complete the login first.',
+      pendingAntigravity: 'Browser opened for Antigravity authentication. Please complete the login.',
+      pendingClaude: 'Browser opened for Claude Code authentication. Please complete the login.',
+      pendingCodex: 'Browser opened for Codex authentication. Please complete the login.',
+      pendingGemini: 'Browser opened for Gemini authentication. Please complete the login.',
+      pendingGithubCopilot: 'GitHub Copilot authentication started. Please complete the device-code login in the browser.',
+      pendingQwen: 'Browser opened for Qwen authentication. Please complete the login.',
+      genericCompleted: 'Authentication completed and local credentials were detected.',
+      antigravity: 'Antigravity authentication completed and local credentials were detected.',
+      claude: 'Claude Code authentication completed and local credentials were detected.',
+      codex: 'Codex authentication completed and local credentials were detected.',
+      gemini: 'Gemini authentication completed and local credentials were detected.',
+      githubCopilot: 'GitHub Copilot authentication completed and local credentials were detected.',
+      qwen: 'Qwen authentication completed and local credentials were detected.'
+    },
+    qwen: {
+      title: 'Qwen Account Email',
+      description: 'Enter your Qwen account email address',
+      placeholder: 'your.email@example.com'
+    },
+    zai: {
+      title: 'Z.AI API Key',
+      description: 'Enter your Z.AI API key from z.ai/manage-apikey/apikey-list',
+      addKey: 'Add Key',
+      success: 'Z.AI API key added successfully.\n\nYou can now use GLM models through the proxy.'
+    },
+    remove: {
+      title: 'Remove Account',
+      confirm: ({ email, serviceName }) => `Are you sure you want to remove ${email} from ${serviceName}?`,
+      removedTitle: 'Removed',
+      removedMessage: ({ email }) => `Removed ${email}`,
+      failed: 'Failed to remove account'
+    },
+    usage: {
+      query: 'Query Usage',
+      refresh: 'Refresh Usage',
+      querying: 'Querying current usage...',
+      failed: 'Failed to query usage.',
+      overview: 'Codex Usage Overview',
+      expand: 'Expand',
+      collapse: 'Collapse',
+      updatedAt: 'Updated',
+      plan: 'Plan',
+      status: 'Status',
+      limitReached: 'Limit Reached',
+      used: 'Used',
+      remaining: 'Remaining',
+      cycle: 'Cycle',
+      resetAt: 'Resets',
+      timeLeft: 'Time Left',
+      periodStart: 'Period Start',
+      windowLength: 'Window Length',
+      codeReview: 'Code Review',
+      codeReviewStatus: 'Code Review Status',
+      reviewUsed: 'Review Used',
+      reviewResetAt: 'Review Resets',
+      window5h: '5H Window',
+      window5hRemaining: '5H Left',
+      windowWeek: 'Weekly Window',
+      windowWeekRemaining: 'Week Left',
+      primaryWindow: 'Primary Window',
+      secondaryWindow: 'Secondary Window',
+      subtitleFallback: 'Expand to view detailed quota data',
+      subtitleUpdated: ({ value }) => `Last queried: ${value}`,
+      noData: 'No displayable usage data was returned.'
+    }
+  }
+};
+
+function resolveTranslation(obj, parts) {
+  return parts.reduce((value, key) => (value && value[key] != null ? value[key] : null), obj);
+}
+
+function t(key, params = {}) {
+  const parts = key.split('.');
+  const entry = resolveTranslation(TRANSLATIONS[currentLanguage], parts)
+    ?? resolveTranslation(TRANSLATIONS.zh, parts)
+    ?? key;
+  if (typeof entry === 'function') {
+    return entry(params);
+  }
+  return String(entry).replace(/\{(\w+)\}/g, (_, token) => params[token] ?? '');
+}
+
+function loadLanguagePreference() {
+  try {
+    const saved = localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    if (saved === 'zh' || saved === 'en') return saved;
+  } catch (e) {}
+  const systemLanguage = (navigator.language || '').toLowerCase();
+  return systemLanguage.startsWith('zh') ? 'zh' : 'en';
+}
+
+function getLocale() {
+  return currentLanguage === 'zh' ? 'zh-CN' : 'en-US';
+}

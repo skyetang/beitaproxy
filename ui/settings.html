@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>BeitaProxy</title>
+  <link rel="stylesheet" href="settings.css">
+</head>
+<body>
+  <div class="container">
+    <aside class="sidebar">
+      <div class="sidebar-brand" id="sidebarBrand">BeitaProxy</div>
+      <div class="sidebar-nav">
+        <button class="sidebar-item" id="navServerBtn" onclick="setActiveSection('server')">服务状态</button>
+        <button class="sidebar-item" id="navSettingsBtn" onclick="setActiveSection('settings')">基础设置</button>
+        <button class="sidebar-item active" id="navServicesBtn" onclick="setActiveSection('services')">服务账号</button>
+        <button class="sidebar-item" id="navAboutBtn" onclick="setActiveSection('about')">关于</button>
+      </div>
+    </aside>
+
+    <main class="content-shell">
+      <section class="content-panel" id="panelServer">
+        <div class="section">
+          <div class="section-header" id="serverPanelTitle">服务状态</div>
+          <div class="section-content">
+            <div class="row">
+              <span class="row-label" id="serverStatusLabel">服务状态</span>
+              <button class="plain" id="serverBtn" onclick="toggleServer()">
+                <span class="dot" id="serverDot"></span>
+                <span id="serverStatus">未启动</span>
+              </button>
+            </div>
+            <div class="row">
+              <span class="row-label" id="dashboardLabel">Dashboard</span>
+              <button class="secondary" id="openDashboardBtn">打开</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="content-panel" id="panelSettings">
+        <div class="section">
+          <div class="section-header" id="settingsPanelTitle">基础设置</div>
+          <div class="section-content">
+            <div class="row">
+              <span class="row-label" id="languageLabel">语言</span>
+              <div class="language-picker">
+                <button class="language-btn" id="languageZhBtn" onclick="setLanguage('zh')">中文</button>
+                <button class="language-btn" id="languageEnBtn" onclick="setLanguage('en')">EN</button>
+              </div>
+            </div>
+            <div class="row">
+              <span class="row-label" id="launchAtLoginLabel">开机启动</span>
+              <div class="toggle" id="launchToggle" onclick="toggleLaunchAtLogin()"></div>
+            </div>
+            <div class="row">
+              <span class="row-label" id="authFilesLabel">认证文件</span>
+              <button class="secondary" id="openAuthFolderBtn" onclick="vp.openAuthFolder()">打开文件夹</button>
+            </div>
+            <div class="row">
+              <span class="row-label" id="localProxyLabel">本地代理</span>
+              <div class="row-actions">
+                <span class="row-value" id="proxyValue">未设置</span>
+                <button class="secondary" id="proxyBtn" onclick="configureProxy()">设置</button>
+                <button class="plain hidden" id="clearProxyBtn" onclick="clearProxy()">清除</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="content-panel active" id="panelServices">
+        <div class="section">
+          <div class="section-header" id="servicesHeader">服务</div>
+          <div class="section-content" id="services"></div>
+        </div>
+      </section>
+
+      <section class="content-panel" id="panelAbout">
+        <div class="section">
+          <div class="section-header" id="aboutPanelTitle">关于</div>
+          <div class="footer">
+            <p id="footerLine1">BeitaProxy 0.1 版本，基于
+              <a href="https://github.com/router-for-me/CLIProxyAPIPlus" target="_blank">CLIProxyAPIPlus</a> 构建</p>
+            <p id="footerLine2" style="margin-top:4px"></p>
+            <p id="footerLine3" style="margin-top:8px"></p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  
+  <!-- Input Modal -->
+  <div id="inputModal" class="modal-overlay hidden">
+    <div class="modal">
+      <h3 id="modalTitle"></h3>
+      <p id="modalDesc"></p>
+      <input type="text" id="modalInput" placeholder="">
+      <div class="modal-buttons">
+        <button class="secondary" id="modalCancelBtn" onclick="closeModal()">取消</button>
+        <button id="modalSubmitBtn" onclick="submitModal()">继续</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Alert Modal -->
+  <div id="alertModal" class="modal-overlay hidden">
+    <div class="modal alert">
+      <h3 id="alertTitle"></h3>
+      <p id="alertMsg"></p>
+      <div class="modal-buttons">
+        <button id="alertOkBtn" onclick="closeAlert()">确定</button>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Confirm Modal -->
+  <div id="confirmModal" class="modal-overlay hidden">
+    <div class="modal alert">
+      <h3 id="confirmTitle"></h3>
+      <p id="confirmMsg"></p>
+      <div class="modal-buttons">
+        <button class="secondary" id="confirmCancelBtn" onclick="doCancelConfirm()">取消</button>
+        <button class="danger" id="confirmBtn" onclick="doConfirm()">删除</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Choice Modal -->
+  <div id="choiceModal" class="modal-overlay hidden">
+    <div class="modal choice-modal alert">
+      <h3 id="choiceTitle"></h3>
+      <p id="choiceDesc"></p>
+      <div id="choiceOptions" class="choice-options"></div>
+      <div class="modal-buttons">
+        <button class="secondary" id="choiceCancelBtn" onclick="closeChoiceModal()">取消</button>
+      </div>
+    </div>
+  </div>
+  <script src="settings-i18n.js"></script>
+  <script src="settings-modals.js"></script>
+  <script src="settings-renderer.js"></script>
+</body>
+</html>

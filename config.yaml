@@ -1,0 +1,54 @@
+# Server port (CLIProxyAPI runs on 8318, ThinkingProxy forwards from 8317)
+port: 8318
+# Bind to localhost only for security (prevents exposure on public IPs)
+host: 127.0.0.1
+# Management API settings
+remote-management:
+  allow-remote: false
+  secret-key: "" # Leave empty to disable management API
+  panel-github-repository: https://github.com/router-for-me/Cli-Proxy-API-Management-Center
+# Authentication directory (stores OAuth tokens)
+auth-dir: "~/.cli-proxy-api"
+# Logging configuration
+debug: false
+logging-to-file: false
+# Usage statistics
+usage-statistics-enabled: true
+# Network proxy (if needed for corporate networks)
+proxy-url: ""
+# Retry configuration
+request-retry: 3
+# Timeout for upstream provider requests
+# Default: 10m. Set to "0" to disable timeout.
+# Important for Extended Thinking requests which may take 5-10+ minutes.
+request-timeout: "10m"
+# Quota management
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+# OAuth providers for local subscriptions
+# Claude, Codex (GPT), Gemini tokens in ~/.cli-proxy-api/ will be used
+# No fallback - users must authenticate providers they want to use
+
+oauth-model-alias:
+  antigravity:
+    - name: rev19-uic3-1p
+      alias: gemini-2.5-computer-use-preview-10-2025
+    - name: gemini-3-pro-image
+      alias: gemini-3-pro-image-preview
+    - name: gemini-3-pro-high
+      alias: gemini-3-pro-preview
+    - name: gemini-3-flash
+      alias: gemini-3-flash-preview
+    - name: claude-sonnet-4-5
+      alias: gemini-claude-sonnet-4-5
+    - name: claude-sonnet-4-5-thinking
+      alias: gemini-claude-sonnet-4-5-thinking
+    - name: claude-opus-4-5-thinking
+      alias: gemini-claude-opus-4-5-thinking
+ampcode:
+  upstream-url: https://ampcode.com
+  upstream-api-key: ""
+  restrict-management-to-localhost: true
+  model-mappings: []
+  force-model-mappings: false

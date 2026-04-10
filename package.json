@@ -1,0 +1,94 @@
+{
+  "name": "beitaproxy",
+  "version": "1.0.0",
+  "description": "AI Proxy for Claude, Codex, Gemini, Copilot and more",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux",
+    "pack": "electron-builder --dir"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "dependencies": {
+    "@electron/remote": "^2.1.3",
+    "js-yaml": "^4.1.0"
+  },
+  "build": {
+    "appId": "com.beitaproxy.app",
+    "productName": "BeitaProxy",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "ui/**/*",
+      "assets/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "assets/icon512.png",
+      "extendInfo": {
+        "LSUIElement": true
+      },
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["x64"]
+        },
+        {
+          "target": "zip",
+          "arch": ["x64"]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "cli-proxy-api-plus",
+          "to": "cli-proxy-api-plus"
+        },
+        {
+          "from": "config.yaml",
+          "to": "config.yaml"
+        }
+      ]
+    },
+    "win": {
+      "icon": "assets/icon.png",
+      "target": ["nsis", "zip"],
+      "extraResources": [
+        {
+          "from": "cli-proxy-api-plus.exe",
+          "to": "cli-proxy-api-plus.exe"
+        },
+        {
+          "from": "config.yaml",
+          "to": "config.yaml"
+        }
+      ]
+    },
+    "linux": {
+      "icon": "assets/icon.png",
+      "target": ["AppImage", "deb"],
+      "extraResources": [
+        {
+          "from": "cli-proxy-api-plus",
+          "to": "cli-proxy-api-plus"
+        },
+        {
+          "from": "config.yaml",
+          "to": "config.yaml"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
