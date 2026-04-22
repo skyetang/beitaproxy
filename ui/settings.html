@@ -13,6 +13,7 @@
         <button class="sidebar-item" id="navServerBtn" onclick="setActiveSection('server')">服务状态</button>
         <button class="sidebar-item" id="navSettingsBtn" onclick="setActiveSection('settings')">基础设置</button>
         <button class="sidebar-item active" id="navServicesBtn" onclick="setActiveSection('services')">服务账号</button>
+        <button class="sidebar-item" id="navTokensBtn" onclick="setActiveSection('tokens')">Token 统计</button>
         <button class="sidebar-item" id="navAboutBtn" onclick="setActiveSection('about')">关于</button>
       </div>
     </aside>
@@ -24,10 +25,11 @@
           <div class="section-content">
             <div class="row">
               <span class="row-label" id="serverStatusLabel">服务状态</span>
-              <button class="plain" id="serverBtn" onclick="toggleServer()">
-                <span class="dot" id="serverDot"></span>
-                <span id="serverStatus">未启动</span>
-              </button>
+              <div class="row-actions">
+                <span class="row-value" id="serverStatusText">未启动</span>
+                <div class="spinner hidden" id="serverStatusSpinner"></div>
+                <div class="toggle" id="serverToggle" onclick="toggleServerStatus()"></div>
+              </div>
             </div>
             <div class="row">
               <span class="row-label" id="dashboardLabel">Dashboard</span>
@@ -64,6 +66,10 @@
                 <button class="plain hidden" id="clearProxyBtn" onclick="clearProxy()">清除</button>
               </div>
             </div>
+            <div class="row">
+              <span class="row-label" id="clearTokenStatsLabel">清除 Token 统计</span>
+              <button class="danger" id="clearTokenStatsBtn" onclick="clearAllTokenStatistics()">清除全部</button>
+            </div>
           </div>
         </div>
       </section>
@@ -72,6 +78,13 @@
         <div class="section">
           <div class="section-header" id="servicesHeader">服务</div>
           <div class="section-content" id="services"></div>
+        </div>
+      </section>
+
+      <section class="content-panel" id="panelTokens">
+        <div class="section">
+          <div class="section-header" id="tokensHeader">Token 统计</div>
+          <div class="section-content" id="tokenStats"></div>
         </div>
       </section>
 

@@ -6,7 +6,9 @@ function createServicesController({
   escapeHtml,
   sanitizeForAttribute,
   renderUsageState,
+  renderTemporaryTokenState,
   usageStates,
+  temporaryTokenStates,
   expanded,
   expandedUsage,
   getAuthenticating,
@@ -15,7 +17,10 @@ function createServicesController({
   showAlert,
   showConfirm,
   showModal,
-  showChoiceModal
+  showChoiceModal,
+  getAccountDetailTab,
+  resetTemporaryTokenStats,
+  rerender
 }) {
   function getServiceByType(type) {
     return services.find((service) => service.type === type);
@@ -131,11 +136,15 @@ function createServicesController({
   function renderServices() {
     const accounts = getAccounts();
     const visibleServices = getVisibleServices(accounts);
+    const tokenStatsResult = vp.getTokenStatistics ? vp.getTokenStatistics() : { success: false };
+    const temporaryStatsMap = tokenStatsResult && tokenStatsResult.success && tokenStatsResult.stats && tokenStatsResult.stats.temporaryAccounts
+      ? tokenStatsResult.stats.temporaryAccounts
+      : {};
     const container = document.getElementById('services');
     container.innerHTML = '';
 
     if (visibleServices.length === 0) {
-      container.innerHTML = `<div class="no-accounts">${escapeHtml(t('services.noAccountsAdded'))}</div>`;
+      container.innerHTML += `<div class="no-accounts">${escapeHtml(t('services.noAccountsAdded'))}</div>`;
       return;
     }
 
@@ -153,12 +162,16 @@ function createServicesController({
           <div class="toggle ${enabled ? 'on' : ''}" onclick="toggleProvider('${svc.type}')"></div>
           <img class="service-icon ${enabled ? '' : 'disabled'}" src="../assets/${svc.icon}" onerror="this.style.display='none'">
           <span class="service-name ${enabled ? '' : 'disabled'}">${svc.name}</span>
+          ${svc.type === 'codex' ? `<button class="secondary account-action-btn provider-inline-btn" onclick="expandAndQueryAllCodexAccounts()">${t('services.queryAllUsage')}</button>` : ''}
           ${!enabled ? `<span class="badge">(${t('common.disabled')})</span>` : ''}
           ${getAuthenticating() === svc.type ? '<div class="spinner"></div>' : ''}
         </div>`;
 
       if (svcAccounts.length > 0) {
         const enabledAccountCount = svcAccounts.filter((account) => !account.disabled).length;
+        const designatedAccountId = enabledAccountCount === 1
+          ? (svcAccounts.find((account) => !account.disabled) || {}).id
+          : null;
         const showRoundRobin = enabledAccountCount > 1;
         const meta = showRoundRobin
           ? `<span class="meta">• ${escapeHtml(t('services.roundRobin'))}</span>`
@@ -174,12 +187,18 @@ function createServicesController({
 
         for (const account of svcAccounts) {
           const safeId = sanitizeForAttribute(account.id);
-          const isCodex = svc.type === 'codex';
           const usageState = usageStates[account.id];
+          const detailTab = getAccountDetailTab(account.id);
+          const temporaryStats = temporaryTokenStates[account.id] || { loading: false, error: null, stats: account.temporaryKey ? (temporaryStatsMap[account.temporaryKey] || {}) : {} };
           const canToggleDisabled = svcAccounts.length > 1;
           const disableBlocked = !account.disabled && enabledAccountCount <= 1;
           const dotClass = account.disabled ? 'gray' : (account.expired ? 'orange' : 'green');
+          const isDetailExpanded = expandedUsage.has(account.id);
+          const isDesignated = designatedAccountId === account.id;
           const labelParts = [];
+          if (isDesignated) {
+            labelParts.push(t('services.designatedAccount'));
+          }
           if (account.expired && !account.disabled) {
             labelParts.push(t('services.expired'));
           }
@@ -188,20 +207,23 @@ function createServicesController({
           }
           const suffix = labelParts.length ? ` (${labelParts.join(', ')})` : '';
           html += `
-            <div class="account-item">
-              <div class="account-line">
-                <span class="dot ${dotClass}"></span>
-                <span class="account-email ${account.expired ? 'expired' : ''} ${account.disabled ? 'disabled' : ''}">${escapeHtml(account.email)}${escapeHtml(suffix)}</span>
+            <div class="account-item ${isDetailExpanded ? 'expanded' : 'collapsed'} ${isDesignated ? 'designated' : ''}">
+              <div class="account-line account-line-with-actions">
+                <span class="dot ${isDesignated ? 'green' : dotClass}"></span>
+                <span class="account-email ${account.expired ? 'expired' : ''} ${account.disabled ? 'disabled' : ''} ${isDesignated ? 'designated' : ''}">${escapeHtml(account.email)}${escapeHtml(suffix)}</span>
+                <div class="account-actions inline">
+                  <button class="plain account-expand-btn account-action-btn" onclick="toggleAccountDetails('${safeId}')">${isDetailExpanded ? t('usage.collapse') : t('usage.expand')}</button>
+                  <button class="account-action-btn ${isDesignated ? 'account-designated-btn' : 'secondary account-designate-btn'}" ${isDesignated ? 'disabled' : ''} onclick="designateAccountForUse('${safeId}')">${isDesignated ? t('services.designated') : t('services.designate')}</button>
+                  ${canToggleDisabled ? (account.disabled
+                    ? `<button class="account-action-btn account-enable-btn" onclick="toggleAccountDisabled('${safeId}')">${t('services.enable')}</button>`
+                    : `<button class="account-action-btn secondary account-disable-btn" ${disableBlocked ? 'disabled' : ''} onclick="toggleAccountDisabled('${safeId}')">${t('services.disable')}</button>`)
+                    : ''}
+                  <button class="danger" onclick="removeAccountById('${safeId}')">${t('services.remove')}</button>
+                </div>
               </div>
-              <div class="account-actions">
-                ${canToggleDisabled ? (account.disabled
-                  ? `<button class="secondary" onclick="toggleAccountDisabled('${safeId}')">${t('services.enable')}</button>`
-                  : `<button class="secondary" ${disableBlocked ? 'disabled' : ''} onclick="toggleAccountDisabled('${safeId}')">${t('services.disable')}</button>`)
-                  : ''}
-                ${isCodex ? `<button class="secondary" ${(usageState && usageState.loading) ? 'disabled' : ''} onclick="queryCodexUsage('${safeId}')">${usageState && usageState.usage ? t('usage.refresh') : t('usage.query')}</button>` : ''}
-                <button class="danger" onclick="removeAccountById('${safeId}')">${t('services.remove')}</button>
-              </div>
-              ${isCodex ? renderUsageState(account.id) : ''}
+              ${isDetailExpanded ? (detailTab === 'tokens'
+                ? renderTemporaryTokenState(account, temporaryStats, detailTab)
+                : renderUsageState(account.id, detailTab)) : ''}
             </div>`;
         }
 
@@ -213,6 +235,17 @@ function createServicesController({
       html += '</div>';
       container.innerHTML += html;
     }
+
+    container.querySelectorAll('.account-token-reset-btn').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const accountId = button.dataset.accountId;
+        if (accountId) {
+          resetTemporaryStatsForAccount(accountId);
+        }
+      });
+    });
   }
 
   function toggleProvider(type) {
@@ -255,24 +288,53 @@ function createServicesController({
         t('common.success'),
         result.disabled ? t('services.accountDisabled') : t('services.accountEnabled')
       );
-      renderServices();
+      rerender();
     } catch (e) {
       showAlert(t('common.error'), e.message || t('services.toggleFailed'));
     }
   }
 
+  async function designateAccountForUse(id) {
+    try {
+      const result = vp.designateAccountForUse ? vp.designateAccountForUse(id) : { success: false, error: t('services.designateFailed') };
+      if (!result || !result.success) {
+        showAlert(t('common.error'), (result && result.error) || t('services.designateFailed'));
+        return;
+      }
+      rerender();
+      showAlert(t('common.success'), t('services.accountDesignated'));
+    } catch (e) {
+      showAlert(t('common.error'), e.message || t('services.designateFailed'));
+    }
+  }
+
   async function queryCodexUsage(id) {
-    expandedUsage.delete(id);
-    usageStates[id] = { loading: true };
+    const previousState = usageStates[id] || {};
+    usageStates[id] = {
+      loading: true,
+      usage: previousState.usage || null,
+      error: null,
+      details: null
+    };
     renderServices();
 
     try {
       const result = await vp.getCodexUsage(id);
       usageStates[id] = result.success
-        ? { loading: false, usage: result.usage }
-        : { loading: false, error: result.error || t('usage.failed'), details: result.details };
+        ? { loading: false, usage: result.usage, error: null, details: null }
+        : {
+            loading: false,
+            usage: previousState.usage || null,
+            error: result.error || t('usage.failed'),
+            details: result.details
+          };
     } catch (e) {
-      usageStates[id] = { loading: false, error: e.message || t('usage.failed') };
+      usageStates[id] = {
+        loading: false,
+        usage: previousState.usage || null,
+        error: e.message || t('usage.failed'),
+        details: null
+      };
     }
 
     renderServices();
@@ -328,7 +390,7 @@ function createServicesController({
         const result = vp.importCodexLocalAuth();
         if (result.success) {
           const account = result.account || {};
-          renderServices();
+          rerender();
 
           showAlert(
             t('codex.importSuccess'),
@@ -357,7 +419,7 @@ function createServicesController({
         const result = vp.syncKiroTokenFromIDE();
         if (result.success) {
           showAlert(t('common.success'), t('kiro.syncSuccess', { count: result.updated }));
-          renderServices();
+          rerender();
         } else {
           showAlert(t('kiro.syncFailed'), result.error || t('kiro.syncFailed'));
         }
@@ -368,7 +430,7 @@ function createServicesController({
         const result = vp.importKiroToken();
         if (result.success) {
           showAlert(t('common.success'), t('kiro.importSuccess'));
-          renderServices();
+          rerender();
         } else {
           showAlert(t('kiro.importFailed'), result.error || t('kiro.importFailed'));
         }
@@ -392,7 +454,7 @@ function createServicesController({
         if (key) {
           vp.saveZaiApiKey(key);
           showAlert(t('common.success'), t('zai.success'));
-          renderServices();
+          rerender();
         }
       });
       return;
@@ -409,7 +471,7 @@ function createServicesController({
     try {
       const result = await vp.runAuthCommand(cmd, email);
       setAuthenticating(null);
-      renderServices();
+      rerender();
 
       if (result.success) {
         showAlert(t('auth.completed'), getSuccessMsg(type, result.output || ''));
@@ -422,7 +484,7 @@ function createServicesController({
       }
     } catch (e) {
       setAuthenticating(null);
-      renderServices();
+      rerender();
       showAlert(t('common.error'), e.message);
     }
   }
@@ -475,12 +537,52 @@ function createServicesController({
         } else {
           showAlert(t('common.error'), t('remove.failed'));
         }
-        renderServices();
+        rerender();
       },
       null,
       t('services.remove'),
       t('static.cancel')
     );
+  }
+
+  async function resetTemporaryStatsForAccount(accountId) {
+    const account = getAccounts().find((item) => item.id === accountId);
+    const result = resetTemporaryTokenStats(accountId);
+    if (!result || !result.success) {
+      showAlert(t('common.error'), (result && result.error) || t('common.error'));
+      return;
+    }
+    const temporaryKey = result.temporaryKey || (account && account.temporaryKey);
+    if (account) {
+      temporaryTokenStates[account.id] = {
+        loading: false,
+        error: null,
+        stats: result.stats && result.stats.temporaryAccounts
+          ? (result.stats.temporaryAccounts[temporaryKey] || {
+              totalTokens: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              cachedTokens: 0,
+              reasoningTokens: 0,
+              requestCount: 0
+            })
+          : {
+              totalTokens: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              cachedTokens: 0,
+              reasoningTokens: 0,
+              requestCount: 0
+            }
+      };
+    }
+    if (result.stats) {
+      rerender();
+      showAlert(t('common.success'), t('usage.resetTokenSuccess'));
+      return;
+    }
+    rerender();
+    showAlert(t('common.success'), t('usage.resetTokenSuccess'));
   }
 
   return {
@@ -490,10 +592,12 @@ function createServicesController({
     toggleExpand,
     toggleUsageExpand,
     toggleAccountDisabled,
+    designateAccountForUse,
     queryCodexUsage,
     startAddAccountFlow,
     connect,
-    removeAccountById
+    removeAccountById,
+    resetTemporaryStatsForAccount
   };
 }
 
