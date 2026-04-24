@@ -214,6 +214,9 @@ function createServicesController({
                 <div class="account-actions inline">
                   <button class="plain account-expand-btn account-action-btn" onclick="toggleAccountDetails('${safeId}')">${isDetailExpanded ? t('usage.collapse') : t('usage.expand')}</button>
                   <button class="account-action-btn ${isDesignated ? 'account-designated-btn' : 'secondary account-designate-btn'}" ${isDesignated ? 'disabled' : ''} onclick="designateAccountForUse('${safeId}')">${isDesignated ? t('services.designated') : t('services.designate')}</button>
+                  ${account.type === 'codex'
+                    ? `<button class="account-action-btn secondary" onclick="switchCodexAccount('${safeId}')">${t('codex.switchLocalAuth')}</button>`
+                    : ''}
                   ${canToggleDisabled ? (account.disabled
                     ? `<button class="account-action-btn account-enable-btn" onclick="toggleAccountDisabled('${safeId}')">${t('services.enable')}</button>`
                     : `<button class="account-action-btn secondary account-disable-btn" ${disableBlocked ? 'disabled' : ''} onclick="toggleAccountDisabled('${safeId}')">${t('services.disable')}</button>`)
@@ -338,6 +341,47 @@ function createServicesController({
     }
 
     renderServices();
+  }
+
+  async function switchCodexAccount(id) {
+    try {
+      const accounts = getAccounts();
+      const account = accounts.find((item) => item.id === id);
+      if (!account) {
+        showAlert(t('common.error'), t('codex.switchFailed'));
+        return;
+      }
+
+      const targetPath = vp.getCodexLocalAuthPath ? vp.getCodexLocalAuthPath() : getCodexLocalAuthPath();
+      showConfirm(
+        t('codex.switchConfirmTitle'),
+        t('codex.switchConfirmMessage', { email: account.email, path: targetPath }),
+        () => {
+          const result = vp.switchCodexLocalAuth
+            ? vp.switchCodexLocalAuth(id)
+            : { success: false, error: t('codex.switchFailed') };
+          if (!result || !result.success) {
+            const errorMessage = result && result.error === 'CODEX_SWITCH_MISSING_ACCESS_TOKEN'
+              ? t('codex.switchMissingAccessToken')
+              : ((result && result.error) || t('codex.switchFailed'));
+            showAlert(t('common.error'), errorMessage);
+            return;
+          }
+          showAlert(
+            t('codex.switchSuccess'),
+            t('codex.switchSuccessMessage', {
+              email: result.email || account.email,
+              path: result.filePath || targetPath
+            })
+          );
+        },
+        null,
+        t('codex.switchLocalAuth'),
+        t('static.cancel')
+      );
+    } catch (e) {
+      showAlert(t('common.error'), e.message || t('codex.switchFailed'));
+    }
   }
 
   function startAddAccountFlow() {
@@ -594,6 +638,7 @@ function createServicesController({
     toggleAccountDisabled,
     designateAccountForUse,
     queryCodexUsage,
+    switchCodexAccount,
     startAddAccountFlow,
     connect,
     removeAccountById,

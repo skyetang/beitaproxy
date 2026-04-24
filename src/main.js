@@ -1036,6 +1036,73 @@ function getCodexLocalAuthPath() {
   return getCodexLocalAuthStatus().filePath;
 }
 
+function buildCodexLocalAuthPayload(entry, existingLocalAuth = null) {
+  const data = entry && entry.data ? entry.data : {};
+  const base = existingLocalAuth && typeof existingLocalAuth === 'object' && !Array.isArray(existingLocalAuth)
+    ? { ...existingLocalAuth }
+    : {};
+  const existingTokens = base.tokens && typeof base.tokens === 'object' && !Array.isArray(base.tokens)
+    ? base.tokens
+    : {};
+  const tokens = { ...existingTokens };
+
+  tokens.access_token = data.access_token;
+  tokens.refresh_token = data.refresh_token || null;
+  tokens.id_token = data.id_token || null;
+  tokens.account_id = data.account_id || null;
+
+  return {
+    ...base,
+    email: data.email || data.login || base.email || 'codex-user',
+    last_refresh: data.last_refresh || new Date().toISOString(),
+    tokens
+  };
+}
+
+function switchCodexLocalAuth(accountId) {
+  try {
+    const entry = findAuthAccountEntry(accountId);
+    if (!entry) {
+      return { success: false, error: 'Account not found' };
+    }
+    if (entry.type !== 'codex') {
+      return { success: false, error: 'Account is not a Codex account' };
+    }
+    if (!entry.data.access_token) {
+      return { success: false, error: 'CODEX_SWITCH_MISSING_ACCESS_TOKEN' };
+    }
+
+    const existingResult = readCodexLocalAuth();
+    const filePath = existingResult
+      ? existingResult.filePath
+      : (getCodexLocalAuthCandidates()[0] || CODEX_LOCAL_AUTH_FILE);
+    let existingLocalAuth = existingResult ? existingResult.data : null;
+
+    if (!existingLocalAuth && fs.existsSync(filePath)) {
+      try {
+        existingLocalAuth = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      } catch (e) {
+        return { success: false, error: `Invalid Codex local auth JSON at ${filePath}: ${e.message}` };
+      }
+    }
+
+    const payload = buildCodexLocalAuthPayload(entry, existingLocalAuth);
+
+    ensureParentDir(filePath);
+    writeAuthFile(filePath, payload);
+    scheduleObservedInputsRefresh('Codex local auth changed');
+
+    return {
+      success: true,
+      filePath,
+      email: payload.email,
+      accountId: entry.data.account_id || null
+    };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
 function importCodexLocalAuth() {
   try {
     const result = readCodexLocalAuth();
@@ -2614,6 +2681,7 @@ global.beitaProxy = {
   getCodexLocalAuthStatus,
   getCodexLocalAuthPath,
   importCodexLocalAuth,
+  switchCodexLocalAuth,
   stopCodexAuth: () => stopAuthSession('codex'),
   getCodexUsage,
   getTokenStatistics,

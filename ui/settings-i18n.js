@@ -101,7 +101,14 @@ const TRANSLATIONS = {
       localAuthMissing: ({ path }) => `未找到可导入的本地 Codex 登录信息。\n\n检测路径：${path}`,
       importMessage: ({ action, email }) => `已从本地登录${action} Codex 账号。\n\n账号：${email}`,
       importActionUpdated: '更新',
-      importActionImported: '导入'
+      importActionImported: '导入',
+      switchLocalAuth: '切换 Codex',
+      switchConfirmTitle: '切换 Codex 账号',
+      switchConfirmMessage: ({ email, path }) => `确认将该账号回写到 Codex 本地登录文件吗？\n\n账号：${email}\n目标文件：${path}`,
+      switchSuccess: '切换成功',
+      switchSuccessMessage: ({ email, path }) => `已将账号写回 Codex 本地登录文件。\n\n账号：${email}\n目标文件：${path}`,
+      switchFailed: '切换 Codex 账号失败',
+      switchMissingAccessToken: '当前 Codex 账号缺少 access token，无法写回本地登录文件。'
     },
     kiro: {
       serverNotRunningTitle: '服务未启动',
@@ -325,7 +332,14 @@ const TRANSLATIONS = {
       localAuthMissing: ({ path }) => `No importable local Codex login was found.\n\nChecked path: ${path}`,
       importMessage: ({ action, email }) => `Codex account ${action} from local login.\n\nAccount: ${email}`,
       importActionUpdated: 'updated',
-      importActionImported: 'imported'
+      importActionImported: 'imported',
+      switchLocalAuth: 'Switch Codex',
+      switchConfirmTitle: 'Switch Codex Account',
+      switchConfirmMessage: ({ email, path }) => `Write this account back to Codex local auth?\n\nAccount: ${email}\nTarget file: ${path}`,
+      switchSuccess: 'Switch Successful',
+      switchSuccessMessage: ({ email, path }) => `This account was written back to Codex local auth.\n\nAccount: ${email}\nTarget file: ${path}`,
+      switchFailed: 'Failed to switch Codex account',
+      switchMissingAccessToken: 'The selected Codex account is missing an access token and cannot be written back to local auth.'
     },
     kiro: {
       serverNotRunningTitle: 'Server Not Running',
