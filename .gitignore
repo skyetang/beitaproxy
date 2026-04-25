@@ -11,6 +11,8 @@ node_modules/
 # Downloaded upstream release archives
 CLIProxyAPIPlus_*.tar.gz
 CLIProxyAPIPlus_*.zip
+CLIProxyAPI_*.tar.gz
+CLIProxyAPI_*.zip
 
 # Local logs
 *.log

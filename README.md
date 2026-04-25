@@ -7,14 +7,14 @@
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Electron-47848f">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-28a745">
-  <img alt="Backend" src="https://img.shields.io/badge/backend-CLIProxyAPIPlus-4b3baf">
+  <img alt="Backend" src="https://img.shields.io/badge/backend-CLIProxyAPI-4b3baf">
 </p>
 
 <p align="center">
   English | <a href="#中文说明">中文</a>
 </p>
 
-A desktop AI proxy app built with Electron and powered by [CLIProxyAPIPlus](https://github.com/router-for-me/CLIProxyAPIPlus).
+A desktop AI proxy app built with Electron and powered by [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
 
 ## Quick Links
 
@@ -64,7 +64,7 @@ BeitaProxy runs two local layers:
 1. **ThinkingProxy** on port `8317`
    - Receives local client requests
    - Handles thinking-related model-name transformations for supported Claude flows
-2. **CLIProxyAPIPlus backend** on port `8318`
+2. **CLIProxyAPI backend** on port `8318`
    - Forwards authenticated upstream requests
    - Serves the backend management page
 
@@ -75,10 +75,10 @@ Client / IDE -> http://localhost:8317 -> http://localhost:8318 -> upstream AI se
 ## Requirements
 
 - Node.js 18+
-- `cli-proxy-api-plus` in the project root
+- `cli-proxy-api` in the project root
 - `config.yaml` in the project root
 
-For Windows packaging, `cli-proxy-api-plus.exe` is also used.
+For Windows packaging, `cli-proxy-api.exe` is also used.
 
 ## Quick Start
 
@@ -119,8 +119,8 @@ npm run build:linux
 │   └── settings.html
 ├── static/
 ├── config.yaml
-├── cli-proxy-api-plus
-├── cli-proxy-api-plus.exe
+├── cli-proxy-api
+├── cli-proxy-api.exe
 ├── package.json
 └── LICENSE
 ```
@@ -139,7 +139,7 @@ Distributed under the MIT License. See [LICENSE](LICENSE).
 
 # 中文说明
 
-BeitaProxy 是一个基于 Electron 构建、并由 [CLIProxyAPIPlus](https://github.com/router-for-me/CLIProxyAPIPlus) 提供后端能力的桌面 AI 代理应用。
+BeitaProxy 是一个基于 Electron 构建、并由 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 提供后端能力的桌面 AI 代理应用。
 
 ## 项目简介
 
@@ -177,7 +177,7 @@ BeitaProxy 在本地运行两层服务：
 1. **ThinkingProxy**，端口 `8317`
    - 接收本地客户端请求
    - 对支持的 Claude 请求执行基于模型名的 thinking 转换
-2. **CLIProxyAPIPlus 后端**，端口 `8318`
+2. **CLIProxyAPI 后端**，端口 `8318`
    - 转发带认证信息的上游请求
    - 提供后端管理页面
 
@@ -188,10 +188,10 @@ BeitaProxy 在本地运行两层服务：
 ## 环境要求
 
 - Node.js 18+
-- 项目根目录中存在 `cli-proxy-api-plus`
+- 项目根目录中存在 `cli-proxy-api`
 - 项目根目录中存在 `config.yaml`
 
-Windows 打包时还会使用 `cli-proxy-api-plus.exe`。
+Windows 打包时还会使用 `cli-proxy-api.exe`。
 
 ## 快速开始
 
@@ -232,8 +232,8 @@ npm run build:linux
 │   └── settings.html
 ├── static/
 ├── config.yaml
-├── cli-proxy-api-plus
-├── cli-proxy-api-plus.exe
+├── cli-proxy-api
+├── cli-proxy-api.exe
 ├── package.json
 └── LICENSE
 ```

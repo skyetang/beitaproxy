@@ -24,7 +24,7 @@ const TRANSLATIONS = {
       continue: '继续',
       ok: '确定',
       delete: '删除',
-      footerLine1: '<a href="https://github.com/router-for-me/CLIProxyAPIPlus" target="_blank">BeitaProxy 0.1 版本，基于 CLIProxyAPIPlus 构建</a>',
+      footerLine1: '<a href="https://github.com/router-for-me/CLIProxyAPI" target="_blank">BeitaProxy 0.1 版本，基于 CLIProxyAPI 构建</a>',
       footerLine2: '',
       footerLine3: ''
     },
@@ -255,7 +255,7 @@ const TRANSLATIONS = {
       continue: 'Continue',
       ok: 'OK',
       delete: 'Delete',
-      footerLine1: '<a href="https://github.com/router-for-me/CLIProxyAPIPlus" target="_blank">BeitaProxy 0.1, built on CLIProxyAPIPlus</a>',
+      footerLine1: '<a href="https://github.com/router-for-me/CLIProxyAPI" target="_blank">BeitaProxy 0.1, built on CLIProxyAPI</a>',
       footerLine2: '',
       footerLine3: ''
     },

@@ -30,7 +30,7 @@ const USER_CONFIG_PATH = path.join(AUTH_DIR, 'config.yaml');
 const MERGED_CONFIG_PATH = path.join(AUTH_DIR, 'merged-config.yaml');
 const ENABLED_PROVIDERS_FILE = path.join(AUTH_DIR, 'enabled-providers.json');
 const CODEX_LOCAL_AUTH_FILE = path.join(os.homedir(), '.codex', 'auth.json');
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const CONFIG_FILE = path.join(AUTH_DIR, 'beitaproxy-config.json');
 const TOKEN_STATS_FILE = path.join(app.getPath('userData'), 'token-stats.json');
 const STARTUP_READINESS_TIMEOUT_MS = 15000;
@@ -136,7 +136,7 @@ function getResourcePath(filename) {
 }
 
 function getBackendBinaryName() {
-  return process.platform === 'win32' ? 'cli-proxy-api-plus.exe' : 'cli-proxy-api-plus';
+  return process.platform === 'win32' ? 'cli-proxy-api.exe' : 'cli-proxy-api';
 }
 
 function getBackendBinaryPath() {

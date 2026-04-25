@@ -1,6 +1,6 @@
 {
   "name": "beitaproxy",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "AI Proxy for Claude, Codex, Gemini, Copilot and more",
   "main": "src/main.js",
   "scripts": {
@@ -49,8 +49,8 @@
       ],
       "extraResources": [
         {
-          "from": "cli-proxy-api-plus",
-          "to": "cli-proxy-api-plus"
+          "from": "cli-proxy-api",
+          "to": "cli-proxy-api"
         },
         {
           "from": "config.yaml",
@@ -63,8 +63,8 @@
       "target": ["nsis", "zip"],
       "extraResources": [
         {
-          "from": "cli-proxy-api-plus.exe",
-          "to": "cli-proxy-api-plus.exe"
+          "from": "cli-proxy-api.exe",
+          "to": "cli-proxy-api.exe"
         },
         {
           "from": "config.yaml",
@@ -77,8 +77,8 @@
       "target": ["AppImage", "deb"],
       "extraResources": [
         {
-          "from": "cli-proxy-api-plus",
-          "to": "cli-proxy-api-plus"
+          "from": "cli-proxy-api",
+          "to": "cli-proxy-api"
         },
         {
           "from": "config.yaml",
