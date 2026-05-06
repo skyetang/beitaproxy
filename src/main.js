@@ -6,6 +6,7 @@ const fs = require('fs');
 const http = require('http');
 const net = require('net');
 const os = require('os');
+const crypto = require('crypto');
 const { normalizeCodexUsageResponse } = require('./codex-usage');
 const {
   buildDisabledOAuthProviders,
@@ -29,6 +30,7 @@ const AUTH_DIR = path.join(os.homedir(), '.cli-proxy-api');
 const USER_CONFIG_PATH = path.join(AUTH_DIR, 'config.yaml');
 const MERGED_CONFIG_PATH = path.join(AUTH_DIR, 'merged-config.yaml');
 const ENABLED_PROVIDERS_FILE = path.join(AUTH_DIR, 'enabled-providers.json');
+const MANAGEMENT_SECRET_FILE = path.join(AUTH_DIR, 'beitaproxy-management-secret');
 const CODEX_LOCAL_AUTH_FILE = path.join(os.homedir(), '.codex', 'auth.json');
 const APP_VERSION = '1.0.1';
 const CONFIG_FILE = path.join(AUTH_DIR, 'beitaproxy-config.json');
@@ -39,6 +41,7 @@ const OBSERVED_INPUTS_DEBOUNCE_MS = 400;
 const AUTH_COMPLETION_TIMEOUT_MS = 5 * 60 * 1000;
 const AUTH_COMPLETION_POLL_MS = 500;
 const AUTH_PROCESS_EXIT_GRACE_MS = 3000;
+const TOKEN_STATS_BACKGROUND_SYNC_DELAY_MS = 1500;
 
 // State
 let serverProcess = null;
@@ -52,6 +55,11 @@ let authSessions = {};
 let serverOperationQueue = Promise.resolve();
 let observedInputsMonitor = null;
 let kiroAutoSyncTimer = null;
+let statsAttributionIndexes = {};
+let activeManagementSecretKey = null;
+let tokenStatsSyncTimer = null;
+let tokenStatsSyncInFlight = false;
+let tokenStatsSyncPending = false;
 
 // OAuth provider keys mapping (same as Swift version)
 const OAUTH_PROVIDER_KEYS = {
@@ -103,6 +111,34 @@ function ensureAuthDir() {
   if (!fs.existsSync(AUTH_DIR)) {
     fs.mkdirSync(AUTH_DIR, { recursive: true });
   }
+}
+
+function normalizeManagementSecret(value) {
+  const secret = String(value || '').trim();
+  return secret.length > 0 ? secret : null;
+}
+
+function getInternalManagementSecret() {
+  ensureAuthDir();
+  try {
+    if (fs.existsSync(MANAGEMENT_SECRET_FILE)) {
+      const existing = normalizeManagementSecret(fs.readFileSync(MANAGEMENT_SECRET_FILE, 'utf8'));
+      if (existing) return existing;
+    }
+  } catch (e) {}
+
+  const secret = crypto.randomBytes(32).toString('hex');
+  fs.writeFileSync(MANAGEMENT_SECRET_FILE, `${secret}\n`, 'utf8');
+  try { fs.chmodSync(MANAGEMENT_SECRET_FILE, 0o600); } catch (e) {}
+  return secret;
+}
+
+function getRuntimeManagementSecret(baseRoot = null) {
+  const remoteManagement = baseRoot && typeof baseRoot === 'object' ? baseRoot['remote-management'] : null;
+  const configuredSecret = remoteManagement && typeof remoteManagement === 'object'
+    ? normalizeManagementSecret(remoteManagement['secret-key'] || remoteManagement.secretKey)
+    : null;
+  return configuredSecret || getInternalManagementSecret();
 }
 
 function getSystemProxy() {
@@ -285,7 +321,7 @@ function listAuthAccountEntries(serviceType = null) {
     }
   } catch (e) {}
 
-  return entries;
+  return entries.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
 }
 
 function createAuthEntrySnapshot(serviceType) {
@@ -524,7 +560,9 @@ function getConfigPath() {
     authDir: AUTH_DIR,
     ensureAuthDir
   });
-  const needsMergedConfig = isUserConfig || disabledProviders.length > 0 || zaiKeys.length > 0;
+  const managementSecretKey = getRuntimeManagementSecret(baseRoot);
+  activeManagementSecretKey = managementSecretKey;
+  const needsMergedConfig = isUserConfig || disabledProviders.length > 0 || zaiKeys.length > 0 || !!managementSecretKey;
 
   if (!needsMergedConfig) {
     return bundledConfigPath;
@@ -534,7 +572,8 @@ function getConfigPath() {
     baseRoot: baseRoot,
     disabledProviders,
     zaiKeys,
-    zaiEnabled: isProviderEnabled('zai')
+    zaiEnabled: isProviderEnabled('zai'),
+    managementSecretKey
   });
   return writeMergedConfig({
     fs,
@@ -635,6 +674,7 @@ function enqueueServerOperation(operation) {
 }
 
 function requestRestartAfterConfigChange() {
+  resetStatsAttributionIndexes();
   return restartServerIfRunning();
 }
 
@@ -1186,6 +1226,7 @@ function guessProviderFromModel(model) {
   const value = String(model || '').trim().toLowerCase();
   if (!value) return null;
   if (value.startsWith('claude-')) return 'claude';
+  if (value.startsWith('gemini-claude-') || value.startsWith('gemini-3-') || value.startsWith('rev19-')) return 'antigravity';
   if (value.startsWith('gpt-') || value.startsWith('o1') || value.startsWith('o3') || value.startsWith('o4') || value.includes('codex')) return 'codex';
   if (value.startsWith('gemini-') || value.startsWith('gemma-')) return 'gemini';
   if (value.startsWith('glm-')) return 'zai';
@@ -1194,13 +1235,107 @@ function guessProviderFromModel(model) {
   return null;
 }
 
-function resolveAccountEntryForRequest(body) {
+function resetStatsAttributionIndexes(provider = null) {
+  if (provider) {
+    delete statsAttributionIndexes[String(provider)];
+    return;
+  }
+  statsAttributionIndexes = {};
+}
+
+function getRequestHeaderValue(headers, names) {
+  const source = headers || {};
+  for (const name of names) {
+    const direct = source[name];
+    if (direct != null) return Array.isArray(direct) ? direct[0] : direct;
+    const lower = source[String(name).toLowerCase()];
+    if (lower != null) return Array.isArray(lower) ? lower[0] : lower;
+  }
+  return null;
+}
+
+function findFirstStringValue(root, keys) {
+  const targets = new Set(keys.map(key => String(key || '').replace(/[^a-z0-9]/gi, '').toLowerCase()));
+  const visited = new Set();
+
+  function walk(value) {
+    if (!value || typeof value !== 'object') return null;
+    if (visited.has(value)) return null;
+    visited.add(value);
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = walk(item);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    for (const [key, nested] of Object.entries(value)) {
+      const normalizedKey = String(key || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+      if (targets.has(normalizedKey) && nested != null && typeof nested !== 'object') {
+        const text = String(nested).trim();
+        if (text) return text;
+      }
+    }
+
+    for (const nested of Object.values(value)) {
+      const found = walk(nested);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  return walk(root);
+}
+
+function findAccountEntryByAccountId(provider, accountId) {
+  const normalizedAccountId = String(accountId || '').trim().toLowerCase();
+  if (!provider || !normalizedAccountId) return null;
+  return listAuthAccountEntries(provider).find((entry) => {
+    const data = entry.data || {};
+    return data.disabled !== true
+      && String(data.account_id || '').trim().toLowerCase() === normalizedAccountId;
+  }) || null;
+}
+
+function resolveRoundRobinAccountEntry(provider) {
+  const enabledEntries = listAuthAccountEntries(provider).filter((entry) => entry.data.disabled !== true);
+  if (enabledEntries.length === 0) return null;
+  if (enabledEntries.length === 1) return enabledEntries[0];
+
+  const key = String(provider || 'unknown');
+  const index = statsAttributionIndexes[key] || 0;
+  const entry = enabledEntries[index % enabledEntries.length];
+  statsAttributionIndexes[key] = (index + 1) % enabledEntries.length;
+  return entry;
+}
+
+function resolveAccountEntryForRequest(body, headers = {}) {
   let provider = null;
+  let parsedBody = null;
   try {
-    const json = JSON.parse(body || '{}');
-    provider = guessProviderFromModel(json.model);
+    parsedBody = JSON.parse(body || '{}');
+    provider = guessProviderFromModel(parsedBody.model);
   } catch (e) {}
   if (!provider) return null;
+
+  const headerAccountId = getRequestHeaderValue(headers, [
+    'chatgpt-account-id',
+    'x-chatgpt-account-id',
+    'openai-account-id',
+    'x-openai-account-id',
+    'account-id',
+    'x-account-id'
+  ]);
+  const bodyAccountId = parsedBody ? findFirstStringValue(parsedBody, [
+    'account_id',
+    'accountId',
+    'chatgpt_account_id',
+    'chatgptAccountId'
+  ]) : null;
+  const accountMatchedEntry = findAccountEntryByAccountId(provider, headerAccountId || bodyAccountId);
+  if (accountMatchedEntry) return accountMatchedEntry;
 
   const selectedAccounts = getSelectedAccounts();
   const selectedId = selectedAccounts[provider];
@@ -1211,12 +1346,7 @@ function resolveAccountEntryForRequest(body) {
     }
   }
 
-  const enabledEntries = listAuthAccountEntries(provider).filter((entry) => entry.data.disabled !== true);
-  if (enabledEntries.length === 1) {
-    return enabledEntries[0];
-  }
-
-  return null;
+  return resolveRoundRobinAccountEntry(provider);
 }
 
 function sanitizeTokenCount(value) {
@@ -1375,6 +1505,39 @@ function normalizeDailyMap(value) {
   return next;
 }
 
+function normalizeDailyEntry(entry) {
+  const next = {
+    global: mergeTokenBreakdowns(createEmptyTokenBreakdown(), (entry && entry.global) || {}),
+    accounts: mergeBreakdownEntries(entry && entry.accounts)
+  };
+  const accountTotals = Object.values(next.accounts || {})
+    .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
+  next.global = maxTokenBreakdowns(next.global, accountTotals);
+  return next;
+}
+
+function reconcileTokenStatsStore(store) {
+  for (const dayEntry of Object.values(store.daily || {})) {
+    const accountTotals = Object.values((dayEntry && dayEntry.accounts) || {})
+      .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
+    dayEntry.global = maxTokenBreakdowns(dayEntry.global || createEmptyTokenBreakdown(), accountTotals);
+  }
+
+  const statsKeys = new Set([
+    ...Object.keys(store.accounts || {}),
+    ...Object.values(store.daily || {}).flatMap((dayEntry) => Object.keys((dayEntry && dayEntry.accounts) || {}))
+  ]);
+  for (const statsKey of statsKeys) {
+    store.accounts[statsKey] = maxTokenBreakdowns(store.accounts[statsKey] || createEmptyTokenBreakdown(), sumStoreDailyTotals(store, statsKey));
+  }
+
+  const accountTotals = Object.values(store.accounts || {})
+    .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
+  store.global = maxTokenBreakdowns(store.global || createEmptyTokenBreakdown(), sumStoreDailyTotals(store, null));
+  store.global = maxTokenBreakdowns(store.global, accountTotals);
+  return store;
+}
+
 function addUsageToDailyStore(store, dayKey, statsKey, usage) {
   const bucket = ensureDailyBucket(store, dayKey);
   bucket.global = mergeTokenBreakdowns(bucket.global || createEmptyTokenBreakdown(), usage);
@@ -1430,6 +1593,81 @@ function buildPeriodStats(store, keys = null) {
   };
 }
 
+function buildDailyDetailRows(store) {
+  const rows = [];
+  for (const [dayKey, dayEntry] of Object.entries(store.daily || {})) {
+    for (const [statsKey, totals] of Object.entries((dayEntry && dayEntry.accounts) || {})) {
+      const breakdown = mergeTokenBreakdowns(createEmptyTokenBreakdown(), totals || {});
+      const hasStats = breakdown.totalTokens
+        || breakdown.inputTokens
+        || breakdown.outputTokens
+        || breakdown.cachedTokens
+        || breakdown.reasoningTokens
+        || breakdown.requestCount;
+      if (!hasStats) continue;
+
+      const meta = store.accountMeta[statsKey] || createEmptyAccountMeta();
+      const provider = meta.provider || String(statsKey.split('::')[0] || 'unknown');
+      rows.push({
+        id: `${dayKey}::${statsKey}`,
+        day: dayKey,
+        statsKey,
+        provider,
+        email: meta.email || meta.login || statsKey,
+        login: meta.login || null,
+        accountId: meta.accountId || null,
+        ...breakdown
+      });
+    }
+  }
+
+  rows.sort((a, b) => {
+    const dayOrder = String(b.day || '').localeCompare(String(a.day || ''));
+    if (dayOrder !== 0) return dayOrder;
+    const providerOrder = String(a.provider || '').localeCompare(String(b.provider || ''));
+    if (providerOrder !== 0) return providerOrder;
+    return String(a.email || '').localeCompare(String(b.email || ''));
+  });
+
+  return rows;
+}
+
+function buildDailySummaryRows(store) {
+  const rows = [];
+  for (const [dayKey, dayEntry] of Object.entries(store.daily || {})) {
+    const accountTotals = Object.values((dayEntry && dayEntry.accounts) || {})
+      .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
+    const globalTotals = mergeTokenBreakdowns(createEmptyTokenBreakdown(), (dayEntry && dayEntry.global) || {});
+    const mergedTotals = maxTokenBreakdowns(globalTotals, accountTotals);
+    const hasStats = mergedTotals.totalTokens
+      || mergedTotals.inputTokens
+      || mergedTotals.outputTokens
+      || mergedTotals.cachedTokens
+      || mergedTotals.reasoningTokens
+      || mergedTotals.requestCount;
+    if (!hasStats) continue;
+
+    rows.push({
+      id: dayKey,
+      day: dayKey,
+      ...mergeTokenBreakdowns(createEmptyTokenBreakdown(), mergedTotals)
+    });
+  }
+
+  rows.sort((a, b) => String(b.day || '').localeCompare(String(a.day || '')));
+  return rows;
+}
+
+function hasTokenBreakdownStats(value) {
+  return !!(value
+    && (value.totalTokens
+      || value.inputTokens
+      || value.outputTokens
+      || value.cachedTokens
+      || value.reasoningTokens
+      || value.requestCount));
+}
+
 function buildTokenStatisticsPayload(store) {
   const currentAccounts = getAuthAccounts();
   const currentStatsById = {};
@@ -1438,17 +1676,26 @@ function buildTokenStatisticsPayload(store) {
   const historicalByProvider = {};
 
   for (const account of currentAccounts) {
-    currentStatsById[account.id] = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.accounts[account.statsKey] || {});
+    const storedTotals = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.accounts[account.statsKey] || {});
     ensureTemporaryAccountStats(store, account.temporaryKey);
-    temporaryAccounts[account.temporaryKey] = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.temporaryAccounts[account.temporaryKey] || {});
+    const temporary = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.temporaryAccounts[account.temporaryKey] || {});
+    temporaryAccounts[account.temporaryKey] = temporary;
+    currentStatsById[account.id] = hasTokenBreakdownStats(storedTotals) ? storedTotals : temporary;
   }
 
-  for (const [statsKey, totals] of Object.entries(store.accounts || {})) {
+  const statsKeys = new Set([
+    ...Object.keys(store.accounts || {}),
+    ...currentAccounts.map((account) => account.statsKey).filter(Boolean)
+  ]);
+
+  for (const statsKey of statsKeys) {
     const meta = store.accountMeta[statsKey] || createEmptyAccountMeta();
     const activeAccount = currentAccounts.find((account) => account.statsKey === statsKey) || null;
     const provider = meta.provider || (activeAccount && activeAccount.type) || String(statsKey.split('::')[0] || 'unknown');
-    const temporaryKey = activeAccount ? buildTemporaryStatsKey({ id: activeAccount.id, type: activeAccount.type, data: { account_id: meta.accountId, email: activeAccount.email, login: activeAccount.login } }) : meta.temporaryKey;
+    const temporaryKey = activeAccount ? activeAccount.temporaryKey : meta.temporaryKey;
     const temporary = temporaryKey ? mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.temporaryAccounts[temporaryKey] || {}) : createEmptyTokenBreakdown();
+    const storedTotals = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.accounts[statsKey] || {});
+    const totals = hasTokenBreakdownStats(storedTotals) ? storedTotals : temporary;
     const history = buildHistorySeries(store, [statsKey]);
     const periodStats = buildPeriodStats(store, [statsKey]);
     const record = {
@@ -1491,7 +1738,9 @@ function buildTokenStatisticsPayload(store) {
     periods: buildPeriodStats(store, null),
     history7d: {
       global: buildHistorySeries(store, null)
-    }
+    },
+    dailySummary: buildDailySummaryRows(store),
+    dailyDetails: buildDailyDetailRows(store)
   };
 }
 
@@ -1512,65 +1761,135 @@ function mergeTokenBreakdowns(base, extra) {
   return next;
 }
 
+function subtractTokenBreakdowns(base, extra) {
+  return {
+    inputTokens: Math.max(0, sanitizeTokenCount((base && base.inputTokens) || 0) - sanitizeTokenCount((extra && extra.inputTokens) || 0)),
+    outputTokens: Math.max(0, sanitizeTokenCount((base && base.outputTokens) || 0) - sanitizeTokenCount((extra && extra.outputTokens) || 0)),
+    cachedTokens: Math.max(0, sanitizeTokenCount((base && base.cachedTokens) || 0) - sanitizeTokenCount((extra && extra.cachedTokens) || 0)),
+    reasoningTokens: Math.max(0, sanitizeTokenCount((base && base.reasoningTokens) || 0) - sanitizeTokenCount((extra && extra.reasoningTokens) || 0)),
+    totalTokens: Math.max(0, sanitizeTokenCount((base && base.totalTokens) || 0) - sanitizeTokenCount((extra && extra.totalTokens) || 0)),
+    requestCount: Math.max(0, sanitizeTokenCount((base && base.requestCount) || 0) - sanitizeTokenCount((extra && extra.requestCount) || 0))
+  };
+}
+
+function tokenCountOrNull(value) {
+  if (value == null || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return Math.round(numeric);
+}
+
+function firstTokenCount(...values) {
+  for (const value of values) {
+    const count = tokenCountOrNull(value);
+    if (count != null) return count;
+  }
+  return null;
+}
+
+function sumTokenCounts(...values) {
+  let total = 0;
+  let found = false;
+  for (const value of values) {
+    const count = tokenCountOrNull(value);
+    if (count == null) continue;
+    total += count;
+    found = true;
+  }
+  return found ? total : null;
+}
+
+function getUsageDetailTokenCount(usage, detailKeys, tokenKeys) {
+  for (const detailKey of detailKeys) {
+    const detail = usage[detailKey];
+    if (!detail || typeof detail !== 'object') continue;
+    const count = firstTokenCount(...tokenKeys.map((tokenKey) => detail[tokenKey]));
+    if (count != null) return count;
+  }
+  return null;
+}
+
 function normalizeUsageBlock(usage) {
   if (!usage || typeof usage !== 'object') {
     return createEmptyTokenBreakdown();
   }
 
-  const inputTokens = sanitizeTokenCount(
-    usage.input_tokens
-      ?? usage.prompt_tokens
-      ?? usage.inputTokens
-      ?? usage.promptTokens
-      ?? usage.prompt
-      ?? 0
+  const inputTokens = firstTokenCount(
+    usage.input_tokens,
+    usage.prompt_tokens,
+    usage.inputTokens,
+    usage.promptTokens,
+    usage.prompt
+  ) ?? 0;
+  const outputTokens = firstTokenCount(
+    usage.output_tokens,
+    usage.completion_tokens,
+    usage.outputTokens,
+    usage.completionTokens,
+    usage.completion
+  ) ?? 0;
+  const separateCachedTokens = sumTokenCounts(
+    usage.cache_creation_input_tokens,
+    usage.cacheCreationInputTokens,
+    usage.cache_read_input_tokens,
+    usage.cacheReadInputTokens
   );
-  const outputTokens = sanitizeTokenCount(
-    usage.output_tokens
-      ?? usage.completion_tokens
-      ?? usage.outputTokens
-      ?? usage.completionTokens
-      ?? usage.completion
-      ?? 0
+  const nestedCachedTokens = getUsageDetailTokenCount(
+    usage,
+    ['input_tokens_details', 'inputTokensDetails', 'prompt_tokens_details', 'promptTokensDetails'],
+    ['cached_tokens', 'cachedTokens']
   );
-  const cachedTokens = sanitizeTokenCount(
-    usage.cache_creation_input_tokens
-      ?? usage.cache_read_input_tokens
-      ?? usage.cached_tokens
-      ?? usage.cachedTokens
-      ?? usage.cacheTokens
-      ?? 0
+  const aggregateCachedTokens = firstTokenCount(
+    usage.input_cached_tokens,
+    usage.inputCachedTokens,
+    usage.prompt_cached_tokens,
+    usage.promptCachedTokens
   );
-  const reasoningTokens = sanitizeTokenCount(
-    usage.reasoning_tokens
-      ?? usage.thinking_tokens
-      ?? usage.reasoningTokens
-      ?? usage.thinkingTokens
-      ?? 0
+  const topLevelCachedTokens = firstTokenCount(
+    usage.cached_tokens,
+    usage.cache_tokens,
+    usage.cachedTokens,
+    usage.cacheTokens
   );
-  const hasDetailedBreakdown = !!(
-    usage.input_tokens != null
-      || usage.prompt_tokens != null
-      || usage.inputTokens != null
-      || usage.promptTokens != null
-      || usage.output_tokens != null
-      || usage.completion_tokens != null
-      || usage.outputTokens != null
-      || usage.completionTokens != null
-      || usage.reasoning_tokens != null
-      || usage.thinking_tokens != null
-      || usage.reasoningTokens != null
-      || usage.thinkingTokens != null
+  const cachedTokens = separateCachedTokens ?? nestedCachedTokens ?? aggregateCachedTokens ?? topLevelCachedTokens ?? 0;
+  const nestedReasoningTokens = getUsageDetailTokenCount(
+    usage,
+    ['output_tokens_details', 'outputTokensDetails', 'completion_tokens_details', 'completionTokensDetails'],
+    ['reasoning_tokens', 'reasoningTokens']
   );
-  const derivedTotalTokens = inputTokens + outputTokens + cachedTokens + reasoningTokens;
-  const totalTokens = hasDetailedBreakdown
-    ? sanitizeTokenCount(derivedTotalTokens)
-    : sanitizeTokenCount(
-        usage.total_tokens
-          ?? usage.totalTokens
-          ?? usage.total
-          ?? derivedTotalTokens
-      );
+  const separateReasoningTokens = firstTokenCount(
+    usage.reasoning_tokens,
+    usage.thinking_tokens,
+    usage.reasoningTokens,
+    usage.thinkingTokens
+  );
+  const aggregateReasoningTokens = firstTokenCount(
+    usage.output_reasoning_tokens,
+    usage.outputReasoningTokens,
+    usage.completion_reasoning_tokens,
+    usage.completionReasoningTokens
+  );
+  const reasoningTokens = nestedReasoningTokens ?? separateReasoningTokens ?? aggregateReasoningTokens ?? 0;
+  const explicitTotalTokens = firstTokenCount(
+    usage.total_tokens,
+    usage.totalTokens,
+    usage.total
+  );
+  const derivedTotalTokens = inputTokens
+    + outputTokens
+    + (
+      separateCachedTokens != null
+        || topLevelCachedTokens != null
+        || (aggregateCachedTokens != null && inputTokens === 0 && outputTokens === 0)
+        ? cachedTokens
+        : 0
+    )
+    + (
+      nestedReasoningTokens == null && aggregateReasoningTokens == null && separateReasoningTokens != null
+        ? reasoningTokens
+        : 0
+    );
+  const totalTokens = explicitTotalTokens ?? derivedTotalTokens;
 
   return {
     inputTokens,
@@ -1696,7 +2015,7 @@ function readTokenStatsStore() {
       }
     }
 
-    return store;
+    return reconcileTokenStatsStore(store);
   } catch (e) {
     return createEmptyTokenStatsStore();
   }
@@ -1740,7 +2059,18 @@ function extractClaudeUsageSnapshot(payload) {
   const total = sanitizeTokenCount(findFirstNumericValue(payload, ['total_tokens', 'totalTokens', 'used_tokens', 'usedTokens', 'tokens_used']));
   const input = sanitizeTokenCount(findFirstNumericValue(payload, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']));
   const output = sanitizeTokenCount(findFirstNumericValue(payload, ['output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens']));
-  const cached = sanitizeTokenCount(findFirstNumericValue(payload, ['cache_creation_input_tokens', 'cache_read_input_tokens', 'cached_tokens', 'cachedTokens']));
+  const separateCached = sumTokenCounts(
+    findFirstNumericValue(payload, ['cache_creation_input_tokens', 'cacheCreationInputTokens']),
+    findFirstNumericValue(payload, ['cache_read_input_tokens', 'cacheReadInputTokens'])
+  );
+  const cached = separateCached ?? sanitizeTokenCount(findFirstNumericValue(payload, [
+    'input_cached_tokens',
+    'inputCachedTokens',
+    'prompt_cached_tokens',
+    'promptCachedTokens',
+    'cached_tokens',
+    'cachedTokens'
+  ]));
   const reasoning = sanitizeTokenCount(findFirstNumericValue(payload, ['reasoning_tokens', 'reasoningTokens', 'thinking_tokens', 'thinkingTokens']));
   const normalizedTotal = total || input + output + cached + reasoning;
   if (!normalizedTotal && !input && !output && !cached && !reasoning) return null;
@@ -1863,6 +2193,605 @@ function fetchJsonWithElectronNet({ url, headers = {}, timeoutMs = 15000 }) {
   });
 }
 
+function isPlainObjectValue(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getActiveManagementSecretKey() {
+  if (activeManagementSecretKey) return activeManagementSecretKey;
+  getConfigPath();
+  return activeManagementSecretKey || getInternalManagementSecret();
+}
+
+function fetchCliProxyUsageStatistics() {
+  const managementSecretKey = getActiveManagementSecretKey();
+  if (!managementSecretKey) {
+    return Promise.resolve({ success: false, error: 'Management key is unavailable' });
+  }
+
+  return fetchJsonWithElectronNet({
+    url: `http://127.0.0.1:${BACKEND_PORT}/v0/management/usage`,
+    headers: {
+      Authorization: `Bearer ${managementSecretKey}`,
+      Accept: 'application/json'
+    },
+    timeoutMs: 10000
+  });
+}
+
+function fetchCliProxyAuthFiles() {
+  const managementSecretKey = getActiveManagementSecretKey();
+  if (!managementSecretKey) {
+    return Promise.resolve({ success: false, error: 'Management key is unavailable' });
+  }
+
+  return fetchJsonWithElectronNet({
+    url: `http://127.0.0.1:${BACKEND_PORT}/v0/management/auth-files`,
+    headers: {
+      Authorization: `Bearer ${managementSecretKey}`,
+      Accept: 'application/json'
+    },
+    timeoutMs: 10000
+  });
+}
+
+function getCliProxyUsageRoot(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  if (isPlainObjectValue(payload.usage)) return payload.usage;
+  if (isPlainObjectValue(payload.data) && isPlainObjectValue(payload.data.usage)) return payload.data.usage;
+  return isPlainObjectValue(payload) ? payload : null;
+}
+
+function getCliProxyAuthFiles(payload) {
+  if (!payload || typeof payload !== 'object') return [];
+  if (Array.isArray(payload.files)) return payload.files.filter(isPlainObjectValue);
+  if (Array.isArray(payload.data)) return payload.data.filter(isPlainObjectValue);
+  if (Array.isArray(payload)) return payload.filter(isPlainObjectValue);
+  return [];
+}
+
+function stringifyIdentifier(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function normalizeIdentityValue(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function addAccountIndexValue(map, value, record) {
+  const key = normalizeIdentityValue(value);
+  if (!key || map.has(key)) return;
+  map.set(key, record);
+}
+
+function getCliProxyAuthFileId(authFile) {
+  const rawId = stringifyIdentifier(authFile.id || authFile.name || authFile.filename || authFile.file);
+  if (rawId) return path.basename(rawId);
+  const rawPath = stringifyIdentifier(authFile.path);
+  return rawPath ? path.basename(rawPath) : null;
+}
+
+function getCliProxyAuthFileAccountId(authFile) {
+  const idToken = isPlainObjectValue(authFile.id_token) ? authFile.id_token : {};
+  return stringifyIdentifier(
+    authFile.account_id
+      || authFile.accountId
+      || authFile.chatgpt_account_id
+      || authFile.chatgptAccountId
+      || idToken.chatgpt_account_id
+      || idToken.chatgptAccountId
+  );
+}
+
+function getCliProxyAuthFileIdentity(authFile) {
+  return stringifyIdentifier(
+    authFile.email
+      || authFile.account
+      || authFile.login
+      || authFile.label
+      || authFile.name
+  );
+}
+
+function buildSyntheticStatsKey(provider, accountId, identity, authFileId) {
+  const normalizedProvider = mapAuthTypeToService(provider);
+  if (!normalizedProvider || normalizedProvider === 'unknown') return null;
+  const suffix = normalizeIdentityValue(accountId || identity || authFileId);
+  return suffix ? `${normalizedProvider}::${suffix}` : null;
+}
+
+function ensureAuthFileAccountMeta(store, authFile, statsKey, provider, accountId, identity) {
+  if (!statsKey) return;
+  const existing = store.accountMeta[statsKey] || createEmptyAccountMeta();
+  const now = new Date().toISOString();
+  store.accountMeta[statsKey] = {
+    ...existing,
+    statsKey,
+    provider: provider || existing.provider || null,
+    email: identity || existing.email || null,
+    login: existing.login || null,
+    accountId: accountId || existing.accountId || null,
+    firstSeenAt: existing.firstSeenAt || now,
+    lastSeenAt: now,
+    lastKnownAccountId: getCliProxyAuthFileId(authFile) || existing.lastKnownAccountId || null,
+    deletedAt: authFile.disabled === true ? (existing.deletedAt || now) : existing.deletedAt || null
+  };
+}
+
+function buildCliProxyUsageAccountIndexes(store, entries, authFiles = []) {
+  const indexes = {
+    byAuthIndex: new Map(),
+    byAccountId: new Map(),
+    byIdentity: new Map(),
+    byStatsKey: new Map(),
+    entriesByProvider: new Map()
+  };
+  const entriesById = new Map();
+  const entriesByPath = new Map();
+
+  for (const entry of entries) {
+    const statsKey = buildAccountStatsKey(entry);
+    const temporaryKey = buildTemporaryStatsKey(entry);
+    if (!statsKey) continue;
+    entriesById.set(entry.id, entry);
+    entriesByPath.set(path.resolve(entry.filePath), entry);
+    ensureAccountMeta(store, entry, { statsKey, temporaryKey });
+
+    const data = entry.data || {};
+    const record = { statsKey, entry, temporaryKey, provider: entry.type };
+    indexes.byStatsKey.set(statsKey, record);
+    addAccountIndexValue(indexes.byAuthIndex, data.auth_index ?? data.authIndex, record);
+    addAccountIndexValue(indexes.byAccountId, data.account_id ?? data.accountId, record);
+    addAccountIndexValue(indexes.byAccountId, data.chatgpt_account_id ?? data.chatgptAccountId, record);
+    addAccountIndexValue(indexes.byIdentity, data.email, record);
+    addAccountIndexValue(indexes.byIdentity, data.login, record);
+    addAccountIndexValue(indexes.byIdentity, data.name, record);
+
+    const providerEntries = indexes.entriesByProvider.get(entry.type) || [];
+    providerEntries.push(record);
+    indexes.entriesByProvider.set(entry.type, providerEntries);
+  }
+
+  for (const authFile of authFiles) {
+    const provider = mapAuthTypeToService(authFile.provider || authFile.type);
+    if (!provider || provider === 'unknown') continue;
+
+    const authFileId = getCliProxyAuthFileId(authFile);
+    const authFilePath = stringifyIdentifier(authFile.path);
+    const entry = (authFileId && entriesById.get(authFileId))
+      || (authFilePath && entriesByPath.get(path.resolve(authFilePath)))
+      || null;
+    const accountId = getCliProxyAuthFileAccountId(authFile);
+    const identity = getCliProxyAuthFileIdentity(authFile);
+    const statsKey = entry ? buildAccountStatsKey(entry) : buildSyntheticStatsKey(provider, accountId, identity, authFileId);
+    if (!statsKey) continue;
+
+    const temporaryKey = entry ? buildTemporaryStatsKey(entry) : null;
+    const record = { statsKey, entry, temporaryKey, provider };
+    if (!indexes.byStatsKey.has(statsKey)) indexes.byStatsKey.set(statsKey, record);
+    addAccountIndexValue(indexes.byAuthIndex, authFile.auth_index ?? authFile.authIndex, record);
+    addAccountIndexValue(indexes.byAccountId, accountId, record);
+    addAccountIndexValue(indexes.byIdentity, identity, record);
+    ensureAuthFileAccountMeta(store, authFile, statsKey, provider, accountId, identity);
+
+    const providerEntries = indexes.entriesByProvider.get(provider) || [];
+    if (!providerEntries.some((item) => item.statsKey === statsKey)) {
+      providerEntries.push(record);
+      indexes.entriesByProvider.set(provider, providerEntries);
+    }
+  }
+
+  for (const [statsKey, meta] of Object.entries(store.accountMeta || {})) {
+    if (!statsKey || indexes.byStatsKey.has(statsKey)) continue;
+    const provider = meta.provider || String(statsKey.split('::')[0] || 'unknown');
+    const record = { statsKey, entry: null, temporaryKey: meta.temporaryKey || null, provider };
+    indexes.byStatsKey.set(statsKey, record);
+    addAccountIndexValue(indexes.byAccountId, meta.accountId, record);
+    addAccountIndexValue(indexes.byIdentity, meta.email, record);
+    addAccountIndexValue(indexes.byIdentity, meta.login, record);
+  }
+
+  return indexes;
+}
+
+function getUsageDetailAuthIndex(detail) {
+  return stringifyIdentifier(
+    detail.auth_index
+      ?? detail.authIndex
+      ?? findFirstStringValue(detail, ['auth_index', 'authIndex'])
+  );
+}
+
+function getUsageDetailProvider(detail, model) {
+  const explicitProvider = stringifyIdentifier(findFirstStringValue(detail, [
+    'provider',
+    'provider_type',
+    'providerType',
+    'service',
+    'service_type',
+    'serviceType'
+  ]));
+  return mapAuthTypeToService(explicitProvider) || guessProviderFromModel(model);
+}
+
+function resolveCliProxyUsageAccountRecord(detail, model, indexes) {
+  const explicitStatsKey = stringifyIdentifier(detail.statsKey ?? detail.stats_key);
+  if (explicitStatsKey && indexes.byStatsKey.has(explicitStatsKey)) {
+    return indexes.byStatsKey.get(explicitStatsKey);
+  }
+
+  const accountId = stringifyIdentifier(findFirstStringValue(detail, [
+    'account_id',
+    'accountId',
+    'chatgpt_account_id',
+    'chatgptAccountId'
+  ]));
+  const accountRecord = indexes.byAccountId.get(normalizeIdentityValue(accountId));
+  if (accountRecord) return accountRecord;
+
+  const authIndex = getUsageDetailAuthIndex(detail);
+  const authRecord = indexes.byAuthIndex.get(normalizeIdentityValue(authIndex));
+  if (authRecord) return authRecord;
+
+  const identity = stringifyIdentifier(findFirstStringValue(detail, [
+    'email',
+    'login',
+    'account',
+    'username',
+    'user'
+  ]));
+  const identityRecord = indexes.byIdentity.get(normalizeIdentityValue(identity));
+  if (identityRecord) return identityRecord;
+
+  const provider = getUsageDetailProvider(detail, model);
+  const providerEntries = provider ? indexes.entriesByProvider.get(provider) || [] : [];
+  return providerEntries.length === 1 ? providerEntries[0] : null;
+}
+
+function getCliProxyUsageDetailDayKey(detail) {
+  const timestamp = stringifyIdentifier(detail.timestamp ?? detail.time ?? detail.created_at ?? detail.createdAt);
+  if (!timestamp) return getLocalDayKey();
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? getLocalDayKey() : getLocalDayKey(date);
+}
+
+function normalizeCliProxyUsageDetailBreakdown(detail) {
+  const tokenSource = isPlainObjectValue(detail.tokens) ? detail.tokens : detail;
+  const breakdown = normalizeUsageBlock(tokenSource);
+  breakdown.requestCount = 1;
+  return breakdown;
+}
+
+function collectCliProxyUsageDetails(usageRoot) {
+  const events = [];
+  const addDetails = (details, context = {}) => {
+    if (!Array.isArray(details)) return;
+    for (const detail of details) {
+      if (!isPlainObjectValue(detail)) continue;
+      events.push({
+        detail,
+        model: stringifyIdentifier(detail.model ?? detail.model_name ?? detail.modelName) || context.model || null,
+        endpoint: context.endpoint || null
+      });
+    }
+  };
+
+  addDetails(usageRoot.details, {});
+
+  const apis = isPlainObjectValue(usageRoot.apis) ? usageRoot.apis : {};
+  for (const [endpoint, apiStats] of Object.entries(apis)) {
+    if (!isPlainObjectValue(apiStats)) continue;
+    addDetails(apiStats.details, { endpoint });
+    const models = isPlainObjectValue(apiStats.models) ? apiStats.models : {};
+    for (const [model, modelStats] of Object.entries(models)) {
+      if (!isPlainObjectValue(modelStats)) continue;
+      addDetails(modelStats.details, { endpoint, model });
+    }
+  }
+
+  return events;
+}
+
+function addUsageToDailyGlobalStore(store, dayKey, usage) {
+  const bucket = ensureDailyBucket(store, dayKey);
+  bucket.global = mergeTokenBreakdowns(bucket.global || createEmptyTokenBreakdown(), usage);
+}
+
+function hasTokenBreakdownValue(value) {
+  return !!(value && (
+    value.totalTokens
+      || value.inputTokens
+      || value.outputTokens
+      || value.cachedTokens
+      || value.reasoningTokens
+      || value.requestCount
+  ));
+}
+
+function maxTokenBreakdowns(base, extra) {
+  const next = {
+    inputTokens: Math.max(sanitizeTokenCount((base && base.inputTokens) || 0), sanitizeTokenCount((extra && extra.inputTokens) || 0)),
+    outputTokens: Math.max(sanitizeTokenCount((base && base.outputTokens) || 0), sanitizeTokenCount((extra && extra.outputTokens) || 0)),
+    cachedTokens: Math.max(sanitizeTokenCount((base && base.cachedTokens) || 0), sanitizeTokenCount((extra && extra.cachedTokens) || 0)),
+    reasoningTokens: Math.max(sanitizeTokenCount((base && base.reasoningTokens) || 0), sanitizeTokenCount((extra && extra.reasoningTokens) || 0)),
+    totalTokens: Math.max(sanitizeTokenCount((base && base.totalTokens) || 0), sanitizeTokenCount((extra && extra.totalTokens) || 0)),
+    requestCount: Math.max(sanitizeTokenCount((base && base.requestCount) || 0), sanitizeTokenCount((extra && extra.requestCount) || 0))
+  };
+  if (!next.totalTokens) {
+    next.totalTokens = next.inputTokens + next.outputTokens + next.cachedTokens + next.reasoningTokens;
+  }
+  return next;
+}
+
+function normalizeCliProxyAggregateBreakdown(tokenValue, requestValue = null) {
+  let breakdown = createEmptyTokenBreakdown();
+  if (isPlainObjectValue(tokenValue)) {
+    breakdown = normalizeUsageBlock(tokenValue);
+  } else {
+    breakdown.totalTokens = sanitizeTokenCount(tokenValue);
+  }
+  breakdown.requestCount = sanitizeTokenCount(
+    requestValue
+      ?? (isPlainObjectValue(tokenValue) ? tokenValue.total_requests ?? tokenValue.totalRequests ?? tokenValue.request_count ?? tokenValue.requestCount : 0)
+  );
+  return breakdown;
+}
+
+function buildCliProxyAggregateStore(usageRoot) {
+  const aggregateStore = createEmptyTokenStatsStore();
+  let hasStats = false;
+
+  const rootBreakdown = normalizeCliProxyAggregateBreakdown(
+    {
+      input_tokens: usageRoot.input_tokens,
+      output_tokens: usageRoot.output_tokens,
+      cached_tokens: usageRoot.cached_tokens,
+      cache_tokens: usageRoot.cache_tokens,
+      reasoning_tokens: usageRoot.reasoning_tokens,
+      total_tokens: usageRoot.total_tokens
+    },
+    usageRoot.total_requests ?? usageRoot.totalRequests
+  );
+  if (hasTokenBreakdownValue(rootBreakdown)) {
+    aggregateStore.global = maxTokenBreakdowns(aggregateStore.global, rootBreakdown);
+    hasStats = true;
+  }
+
+  const tokensByDay = isPlainObjectValue(usageRoot.tokens_by_day)
+    ? usageRoot.tokens_by_day
+    : (isPlainObjectValue(usageRoot.tokensByDay) ? usageRoot.tokensByDay : {});
+  const requestsByDay = isPlainObjectValue(usageRoot.requests_by_day)
+    ? usageRoot.requests_by_day
+    : (isPlainObjectValue(usageRoot.requestsByDay) ? usageRoot.requestsByDay : {});
+  const dayKeys = new Set([...Object.keys(tokensByDay), ...Object.keys(requestsByDay)]);
+
+  for (const dayKey of dayKeys) {
+    const breakdown = normalizeCliProxyAggregateBreakdown(tokensByDay[dayKey], requestsByDay[dayKey]);
+    if (!hasTokenBreakdownValue(breakdown)) continue;
+    addUsageToDailyGlobalStore(aggregateStore, dayKey, breakdown);
+    aggregateStore.global = maxTokenBreakdowns(aggregateStore.global, breakdown);
+    hasStats = true;
+  }
+
+  return { store: aggregateStore, hasStats };
+}
+
+function applyCliProxyAggregateStore(store, aggregateStore) {
+  store.global = maxTokenBreakdowns(store.global || createEmptyTokenBreakdown(), aggregateStore.global || createEmptyTokenBreakdown());
+  for (const [dayKey, dayEntry] of Object.entries(aggregateStore.daily || {})) {
+    const target = ensureDailyBucket(store, dayKey);
+    target.global = maxTokenBreakdowns(target.global || createEmptyTokenBreakdown(), (dayEntry && dayEntry.global) || createEmptyTokenBreakdown());
+  }
+}
+
+function sumStoreDailyTotals(store, statsKey = null) {
+  let totals = createEmptyTokenBreakdown();
+  for (const dayEntry of Object.values(store.daily || {})) {
+    const source = statsKey
+      ? ((dayEntry && dayEntry.accounts && dayEntry.accounts[statsKey]) || null)
+      : ((dayEntry && dayEntry.global) || null);
+    if (source) {
+      totals = mergeTokenBreakdowns(totals, source);
+    }
+  }
+  return totals;
+}
+
+function replaceDailyEntryFromCliProxyDetails(store, dayKey, sourceDayEntry) {
+  const previousDayEntry = normalizeDailyEntry((store.daily || {})[dayKey] || null);
+  const nextDayEntry = normalizeDailyEntry(sourceDayEntry || null);
+  const affectedStatsKeys = new Set([
+    ...Object.keys(previousDayEntry.accounts || {}),
+    ...Object.keys(nextDayEntry.accounts || {})
+  ]);
+
+  store.daily[dayKey] = nextDayEntry;
+  store.global = mergeTokenBreakdowns(
+    subtractTokenBreakdowns(store.global || createEmptyTokenBreakdown(), previousDayEntry.global),
+    nextDayEntry.global
+  );
+
+  for (const statsKey of affectedStatsKeys) {
+    const previousAccountDaily = previousDayEntry.accounts[statsKey] || createEmptyTokenBreakdown();
+    const nextAccountDaily = nextDayEntry.accounts[statsKey] || createEmptyTokenBreakdown();
+    store.accounts[statsKey] = mergeTokenBreakdowns(
+      subtractTokenBreakdowns(store.accounts[statsKey] || createEmptyTokenBreakdown(), previousAccountDaily),
+      nextAccountDaily
+    );
+  }
+
+  return affectedStatsKeys;
+}
+
+function applyCliProxyDetailedStore(store, detailedStore, authoritativeDayKeys = null) {
+  const authoritativeDays = authoritativeDayKeys ? new Set(authoritativeDayKeys) : null;
+  for (const [dayKey, dayEntry] of Object.entries(detailedStore.daily || {})) {
+    if (authoritativeDays && !authoritativeDays.has(dayKey)) {
+      const target = ensureDailyBucket(store, dayKey);
+      target.global = maxTokenBreakdowns(target.global || createEmptyTokenBreakdown(), (dayEntry && dayEntry.global) || createEmptyTokenBreakdown());
+      continue;
+    }
+    replaceDailyEntryFromCliProxyDetails(store, dayKey, dayEntry);
+  }
+  store.global = maxTokenBreakdowns(store.global || createEmptyTokenBreakdown(), sumStoreDailyTotals(store, null));
+  store.global = maxTokenBreakdowns(store.global, detailedStore.global || createEmptyTokenBreakdown());
+  store.accountMeta = {
+    ...(store.accountMeta || {}),
+    ...(detailedStore.accountMeta || {})
+  };
+}
+
+function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
+  const usageRoot = getCliProxyUsageRoot(payload);
+  if (!usageRoot) {
+    return { success: false, error: 'Usage payload is empty' };
+  }
+
+  const entries = listAuthAccountEntries();
+  const rebuiltStore = createEmptyTokenStatsStore();
+  rebuiltStore.accountMeta = normalizeAccountMetaMap(store.accountMeta || {});
+  rebuiltStore.providerSnapshots = store.providerSnapshots || {};
+  const indexes = buildCliProxyUsageAccountIndexes(rebuiltStore, entries, authFiles);
+  const events = collectCliProxyUsageDetails(usageRoot);
+  const detailedDayKeys = new Set();
+  let attributedCount = 0;
+
+  for (const event of events) {
+    const breakdown = normalizeCliProxyUsageDetailBreakdown(event.detail);
+    if (!hasTokenBreakdownValue(breakdown)) continue;
+
+    const dayKey = getCliProxyUsageDetailDayKey(event.detail);
+    detailedDayKeys.add(dayKey);
+    const accountRecord = resolveCliProxyUsageAccountRecord(event.detail, event.model, indexes);
+    rebuiltStore.global = mergeTokenBreakdowns(rebuiltStore.global || createEmptyTokenBreakdown(), breakdown);
+
+    if (accountRecord && accountRecord.statsKey) {
+      attributedCount += 1;
+      rebuiltStore.accounts[accountRecord.statsKey] = mergeTokenBreakdowns(
+        rebuiltStore.accounts[accountRecord.statsKey] || createEmptyTokenBreakdown(),
+        breakdown
+      );
+      addUsageToDailyStore(rebuiltStore, dayKey, accountRecord.statsKey, breakdown);
+      if (accountRecord.entry) {
+        ensureAccountMeta(rebuiltStore, accountRecord.entry, {
+          statsKey: accountRecord.statsKey,
+          temporaryKey: accountRecord.temporaryKey
+        });
+      }
+    } else {
+      addUsageToDailyGlobalStore(rebuiltStore, dayKey, breakdown);
+    }
+  }
+
+  const now = new Date().toISOString();
+  if (events.length > 0) {
+    const aggregate = buildCliProxyAggregateStore(usageRoot);
+    if (aggregate.hasStats) {
+      rebuiltStore.global = maxTokenBreakdowns(rebuiltStore.global, aggregate.store.global);
+      for (const [dayKey, dayEntry] of Object.entries(aggregate.store.daily || {})) {
+        const bucket = ensureDailyBucket(rebuiltStore, dayKey);
+        bucket.global = maxTokenBreakdowns(bucket.global || createEmptyTokenBreakdown(), (dayEntry && dayEntry.global) || createEmptyTokenBreakdown());
+      }
+    }
+
+    applyCliProxyDetailedStore(store, rebuiltStore, detailedDayKeys);
+    store.providerSnapshots = {
+      ...(store.providerSnapshots || {}),
+      'cli-proxy-api:usage': {
+        updatedAt: now,
+        totalRequests: sanitizeTokenCount(usageRoot.total_requests ?? usageRoot.totalRequests),
+        totalTokens: sanitizeTokenCount(usageRoot.total_tokens ?? usageRoot.totalTokens),
+        detailCount: events.length,
+        attributedCount,
+        authoritativeDays: Array.from(detailedDayKeys).sort()
+      }
+    };
+    store.updatedAt = now;
+    return { success: true, detailed: true, detailCount: events.length, attributedCount };
+  }
+
+  const aggregate = buildCliProxyAggregateStore(usageRoot);
+  if (aggregate.hasStats) {
+    applyCliProxyAggregateStore(store, aggregate.store);
+    store.providerSnapshots = {
+      ...(store.providerSnapshots || {}),
+      'cli-proxy-api:usage': {
+        updatedAt: now,
+        totalRequests: sanitizeTokenCount(usageRoot.total_requests ?? usageRoot.totalRequests),
+        totalTokens: sanitizeTokenCount(usageRoot.total_tokens ?? usageRoot.totalTokens),
+        detailCount: 0,
+        attributedCount: 0
+      }
+    };
+    store.updatedAt = now;
+    return { success: true, detailed: false, aggregate: true };
+  }
+
+  return { success: false, error: 'Usage payload has no token statistics' };
+}
+
+async function fetchCliProxyUsageSyncInputs() {
+  const cliProxyUsageResult = await fetchCliProxyUsageStatistics();
+  if (!cliProxyUsageResult.success) {
+    return cliProxyUsageResult;
+  }
+
+  const authFilesResult = await fetchCliProxyAuthFiles();
+  const authFiles = authFilesResult.success ? getCliProxyAuthFiles(authFilesResult.payload) : [];
+  return {
+    success: true,
+    payload: cliProxyUsageResult.payload,
+    authFiles
+  };
+}
+
+async function syncCliProxyUsageStatisticsFromBackend(store) {
+  const inputs = await fetchCliProxyUsageSyncInputs();
+  if (!inputs.success) {
+    return inputs;
+  }
+  return syncCliProxyUsageStatistics(store, inputs.payload, inputs.authFiles);
+}
+
+async function runBackgroundTokenStatsSync() {
+  if (tokenStatsSyncInFlight) {
+    tokenStatsSyncPending = true;
+    return;
+  }
+
+  tokenStatsSyncInFlight = true;
+  try {
+    const inputs = await fetchCliProxyUsageSyncInputs();
+    if (!inputs.success) {
+      return;
+    }
+    const store = readTokenStatsStore();
+    const syncResult = syncCliProxyUsageStatistics(store, inputs.payload, inputs.authFiles);
+    if (syncResult.success) {
+      writeTokenStatsStore(store);
+    }
+  } catch (e) {
+  } finally {
+    tokenStatsSyncInFlight = false;
+    if (tokenStatsSyncPending) {
+      tokenStatsSyncPending = false;
+      scheduleBackgroundTokenStatsSync();
+    }
+  }
+}
+
+function scheduleBackgroundTokenStatsSync() {
+  if (tokenStatsSyncTimer) {
+    clearTimeout(tokenStatsSyncTimer);
+  }
+  tokenStatsSyncTimer = setTimeout(() => {
+    tokenStatsSyncTimer = null;
+    runBackgroundTokenStatsSync();
+  }, TOKEN_STATS_BACKGROUND_SYNC_DELAY_MS);
+}
+
 async function refreshTokenStatistics() {
   try {
     const store = readTokenStatsStore();
@@ -1873,6 +2802,21 @@ async function refreshTokenStatistics() {
       const temporaryKey = buildTemporaryStatsKey(entry);
       if (!statsKey) continue;
       ensureAccountMeta(store, entry, { statsKey, temporaryKey });
+    }
+
+    const cliProxySyncResult = await syncCliProxyUsageStatisticsFromBackend(store);
+    if (cliProxySyncResult.success && cliProxySyncResult.detailed) {
+      writeTokenStatsStore(store);
+      return {
+        success: true,
+        stats: buildTokenStatisticsPayload(store)
+      };
+    }
+
+    for (const entry of entries) {
+      const statsKey = buildAccountStatsKey(entry);
+      const temporaryKey = buildTemporaryStatsKey(entry);
+      if (!statsKey) continue;
       const provider = entry.type;
       const accessToken = entry.data.access_token || entry.data.token;
       if (!accessToken) continue;
@@ -1917,6 +2861,13 @@ async function refreshTokenStatistics() {
 
       if (!snapshotKey) continue;
       if (snapshot) {
+        const previousSnapshot = store.providerSnapshots[snapshotKey] || null;
+        if (previousSnapshot) {
+          updateSnapshotTotals(store, previousSnapshot, snapshot, statsKey, {
+            entry,
+            temporaryKey
+          });
+        }
         store.providerSnapshots[snapshotKey] = snapshot;
         store.updatedAt = new Date().toISOString();
       }
@@ -2089,7 +3040,7 @@ function startThinkingProxy() {
           headers: { ...req.headers }
         };
 
-        const resolvedAccountEntry = req.method === 'POST' ? resolveAccountEntryForRequest(modifiedBody) : null;
+        const resolvedAccountEntry = req.method === 'POST' ? resolveAccountEntryForRequest(modifiedBody, req.headers) : null;
         const resolvedStatsKey = resolvedAccountEntry ? buildAccountStatsKey(resolvedAccountEntry) : null;
         const resolvedTemporaryKey = resolvedAccountEntry ? buildTemporaryStatsKey(resolvedAccountEntry) : null;
         const responseChunks = [];
@@ -2118,13 +3069,15 @@ function startThinkingProxy() {
 
           proxyRes.on('end', () => {
             res.end();
-            if (!resolvedStatsKey) return;
             const contentType = String(proxyRes.headers['content-type'] || '').toLowerCase();
             const responseText = Buffer.concat(responseChunks).toString('utf8');
-            recordTokenUsage(resolvedStatsKey, extractUsageFromResponse(responseText, contentType), {
-              entry: resolvedAccountEntry,
-              temporaryKey: resolvedTemporaryKey
-            });
+            if (resolvedStatsKey) {
+              recordTokenUsage(resolvedStatsKey, extractUsageFromResponse(responseText, contentType), {
+                entry: resolvedAccountEntry,
+                temporaryKey: resolvedTemporaryKey
+              });
+            }
+            scheduleBackgroundTokenStatsSync();
           });
         });
 
@@ -2302,6 +3255,7 @@ async function startServerInternal() {
   if (isServerRunning) return;
 
   ensureAuthDir();
+  resetStatsAttributionIndexes();
   await startThinkingProxy();
   await waitForPort('127.0.0.1', PROXY_PORT);
   await startBackendServer();
@@ -2647,6 +3601,10 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', (e) => e.preventDefault());
 
 app.on('before-quit', async () => {
+  if (tokenStatsSyncTimer) {
+    clearTimeout(tokenStatsSyncTimer);
+    tokenStatsSyncTimer = null;
+  }
   cleanupAllAuthSessions();
   stopObservedInputMonitoring();
   stopKiroAutoSync();

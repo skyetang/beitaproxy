@@ -249,6 +249,15 @@ function createUsageRenderer({
     return `<div class="token-period-tabs">${periods.map(([value, label]) => `<button type="button" class="language-btn ${activePeriod === value ? 'active' : ''}" onclick="setTokenStatsPeriod('${value}')">${escapeHtml(label)}</button>`).join('')}</div>`;
   }
 
+  function renderTokenStatsViewTabs(activeView) {
+    const tabs = [
+      ['overview', t('tokenStats.overviewTab')],
+      ['dailySummary', t('tokenStats.dailySummaryTab')],
+      ['daily', t('tokenStats.dailyTab')]
+    ];
+    return `<div class="token-view-tabs">${tabs.map(([value, label]) => `<button type="button" class="language-btn ${activeView === value ? 'active' : ''}" onclick="setTokenStatsView('${value}')">${escapeHtml(label)}</button>`).join('')}</div>`;
+  }
+
   function renderTokenStatsSummary(state, activePeriod = 'week') {
     if (!state) return '';
     const stats = state.stats || {};
@@ -335,7 +344,182 @@ function createUsageRenderer({
     </div>`;
   }
 
-  function renderTokenStatsPage({ state, historicalByProvider, services, expandedTokenAccounts, activePeriod = 'week' }) {
+  function getServiceName(provider, services) {
+    const service = (services || []).find((item) => item.type === provider);
+    return service ? service.name : String(provider || t('common.unknown'));
+  }
+
+  function renderMetricHeaderCells() {
+    return [
+      ['token-metric-total', t('tokenStats.totalLabel')],
+      ['token-metric-input', t('tokenStats.input')],
+      ['token-metric-output', t('tokenStats.output')],
+      ['token-metric-cached', t('tokenStats.cached')],
+      ['token-metric-reasoning', t('tokenStats.reasoning')],
+      ['token-metric-requests', t('tokenStats.requests')]
+    ].map(([className, label]) => `<th class="${className}">${escapeHtml(label)}</th>`).join('');
+  }
+
+  function renderMetricCells(row) {
+    return [
+      ['token-metric-total', row.totalTokens],
+      ['token-metric-input', row.inputTokens],
+      ['token-metric-output', row.outputTokens],
+      ['token-metric-cached', row.cachedTokens],
+      ['token-metric-reasoning', row.reasoningTokens],
+      ['token-metric-requests', row.requestCount]
+    ].map(([className, value]) => `<td class="token-number-cell ${className}">${escapeHtml(formatUsageNumber(value || 0))}</td>`).join('');
+  }
+
+  function filterAndPaginateDailyRows(rows, dailyDate, dailyPage, dailyPageSize) {
+    const filteredRows = dailyDate
+      ? rows.filter((row) => row.day === dailyDate)
+      : rows;
+    const pageSize = Math.max(1, Number(dailyPageSize) || 10);
+    const pageCount = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+    const currentPage = Math.min(Math.max(1, Number(dailyPage) || 1), pageCount);
+    const startIndex = (currentPage - 1) * pageSize;
+    return {
+      filteredRows,
+      pageRows: filteredRows.slice(startIndex, startIndex + pageSize),
+      currentPage,
+      pageCount
+    };
+  }
+
+  function renderDailyTableControls(dailyDate, accountFilter = '') {
+    const safeDate = escapeHtml(dailyDate || '');
+    const clearButton = dailyDate
+      ? `<button type="button" class="secondary" onclick="setTokenStatsDailyDate('')">${escapeHtml(t('tokenStats.clearDate'))}</button>`
+      : '';
+    return `<div class="token-daily-controls">
+      <label class="token-date-filter">
+        <span>${escapeHtml(t('tokenStats.dateFilter'))}</span>
+        <input type="date" value="${safeDate}" onchange="setTokenStatsDailyDate(this.value)">
+      </label>
+      ${accountFilter}
+      ${clearButton}
+    </div>`;
+  }
+
+  function renderDailyPagination(currentPage, pageCount, totalRows) {
+    const previousDisabled = currentPage <= 1 ? 'disabled' : '';
+    const nextDisabled = currentPage >= pageCount ? 'disabled' : '';
+    return `<div class="token-pagination">
+      <button type="button" class="secondary" ${previousDisabled} onclick="setTokenStatsDailyPage(${currentPage - 1})">${escapeHtml(t('tokenStats.previousPage'))}</button>
+      <span>${escapeHtml(t('tokenStats.dailyPageInfo', { page: currentPage, pages: pageCount, total: totalRows }))}</span>
+      <button type="button" class="secondary" ${nextDisabled} onclick="setTokenStatsDailyPage(${currentPage + 1})">${escapeHtml(t('tokenStats.nextPage'))}</button>
+    </div>`;
+  }
+
+  function renderDailyLoadingAndError(state) {
+    return `${state && state.loading ? `<div class="token-loading-overlay"><div class="spinner"></div><div class="usage-note">${escapeHtml(t('tokenStats.loading'))}</div></div>` : ''}
+      ${state && state.error ? `<div class="usage-note usage-error">${escapeHtml(state.error)}</div>` : ''}`;
+  }
+
+  function renderDailySummaryTable({ state, stats, dailyPage = 1, dailyDate = '', dailyPageSize = 10 }) {
+    const allRows = Array.isArray(stats && stats.dailySummary) ? stats.dailySummary : [];
+    const { filteredRows, pageRows, currentPage, pageCount } = filterAndPaginateDailyRows(allRows, dailyDate, dailyPage, dailyPageSize);
+    const rowsHtml = pageRows.map((row) => `<tr>
+      <td class="token-date-cell">${escapeHtml(row.day || '')}</td>
+      ${renderMetricCells(row)}
+    </tr>`).join('');
+    const tableBody = rowsHtml || `<tr><td colspan="7" class="token-empty-cell">${escapeHtml(t('tokenStats.dailySummaryTableEmpty'))}</td></tr>`;
+
+    return `<div class="usage-card token-account-card token-summary-shell">
+      <div class="usage-heading">
+        <span class="usage-title">${escapeHtml(t('tokenStats.dailySummaryTitle'))}</span>
+        <span class="usage-subtitle">${escapeHtml(t('tokenStats.dailyPageInfo', { page: currentPage, pages: pageCount, total: filteredRows.length }))}</span>
+      </div>
+      ${renderDailyTableControls(dailyDate)}
+      <div class="token-table-wrap">
+        <table class="token-detail-table token-summary-table">
+          <thead>
+            <tr>
+              <th class="token-date-cell">${escapeHtml(t('tokenStats.dailyDate'))}</th>
+              ${renderMetricHeaderCells()}
+            </tr>
+          </thead>
+          <tbody>${tableBody}</tbody>
+        </table>
+      </div>
+      ${renderDailyPagination(currentPage, pageCount, filteredRows.length)}
+      ${renderDailyLoadingAndError(state)}
+    </div>`;
+  }
+
+  function buildDailyAccountOptions(stats, rows, services, selectedAccount) {
+    const options = new Map();
+    for (const record of (stats && stats.historicalAccounts) || []) {
+      if (!record || !record.statsKey) continue;
+      const serviceName = getServiceName(record.provider, services);
+      options.set(record.statsKey, `${serviceName} · ${record.email || record.statsKey}`);
+    }
+    for (const row of rows || []) {
+      if (!row || !row.statsKey || options.has(row.statsKey)) continue;
+      const serviceName = getServiceName(row.provider, services);
+      options.set(row.statsKey, `${serviceName} · ${row.email || row.statsKey}`);
+    }
+    if (selectedAccount && !options.has(selectedAccount)) {
+      options.set(selectedAccount, selectedAccount);
+    }
+    return Array.from(options.entries())
+      .sort((a, b) => String(a[1] || '').localeCompare(String(b[1] || '')));
+  }
+
+  function renderDailyAccountFilter(stats, rows, services, selectedAccount) {
+    const options = buildDailyAccountOptions(stats, rows, services, selectedAccount);
+    if (!options.length) return '';
+    const optionHtml = [
+      `<option value="">${escapeHtml(t('tokenStats.allAccounts'))}</option>`,
+      ...options.map(([value, label]) => `<option value="${escapeHtml(value)}" ${value === selectedAccount ? 'selected' : ''}>${escapeHtml(label)}</option>`)
+    ].join('');
+    return `<label class="token-account-filter">
+      <span>${escapeHtml(t('tokenStats.accountFilter'))}</span>
+      <select onchange="setTokenStatsDailyAccount(this.value)">${optionHtml}</select>
+    </label>`;
+  }
+
+  function renderDailyDetailsTable({ state, stats, services, dailyPage = 1, dailyDate = '', dailyAccount = '', dailyPageSize = 10 }) {
+    const allRows = Array.isArray(stats && stats.dailyDetails) ? stats.dailyDetails : [];
+    const accountRows = dailyAccount
+      ? allRows.filter((row) => row.statsKey === dailyAccount)
+      : allRows;
+    const { filteredRows, pageRows, currentPage, pageCount } = filterAndPaginateDailyRows(accountRows, dailyDate, dailyPage, dailyPageSize);
+    const accountFilter = renderDailyAccountFilter(stats, allRows, services, dailyAccount);
+    const rowsHtml = pageRows.map((row) => `<tr>
+      <td class="token-date-cell">${escapeHtml(row.day || '')}</td>
+      <td class="token-provider-cell">${escapeHtml(getServiceName(row.provider, services))}</td>
+      <td class="token-account-cell">${escapeHtml(row.email || row.statsKey || '')}</td>
+      ${renderMetricCells(row)}
+    </tr>`).join('');
+    const tableBody = rowsHtml || `<tr><td colspan="9" class="token-empty-cell">${escapeHtml(t('tokenStats.dailyTableEmpty'))}</td></tr>`;
+
+    return `<div class="usage-card token-account-card token-summary-shell">
+      <div class="usage-heading">
+        <span class="usage-title">${escapeHtml(t('tokenStats.dailyTitle'))}</span>
+        <span class="usage-subtitle">${escapeHtml(t('tokenStats.dailyPageInfo', { page: currentPage, pages: pageCount, total: filteredRows.length }))}</span>
+      </div>
+      ${renderDailyTableControls(dailyDate, accountFilter)}
+      <div class="token-table-wrap">
+        <table class="token-detail-table">
+          <thead>
+            <tr>
+              <th class="token-date-cell">${escapeHtml(t('tokenStats.dailyDate'))}</th>
+              <th class="token-provider-cell">${escapeHtml(t('tokenStats.dailyProvider'))}</th>
+              <th class="token-account-cell">${escapeHtml(t('tokenStats.dailyAccount'))}</th>
+              ${renderMetricHeaderCells()}
+            </tr>
+          </thead>
+          <tbody>${tableBody}</tbody>
+        </table>
+      </div>
+      ${renderDailyPagination(currentPage, pageCount, filteredRows.length)}
+      ${renderDailyLoadingAndError(state)}
+    </div>`;
+  }
+
+  function renderTokenStatsOverview({ state, historicalByProvider, services, expandedTokenAccounts, activePeriod }) {
     const stats = state && state.stats ? state.stats : {};
     const periodStats = stats.periods && stats.periods[activePeriod] ? stats.periods[activePeriod] : null;
     const summary = renderTokenStatsSummary(state, activePeriod);
@@ -346,7 +530,7 @@ function createUsageRenderer({
       if (records.length === 0) return '';
 
       const cards = records.map((record) => {
-        const totals = (record.periodTotals && record.periodTotals[activePeriod]) || record.totals || {};
+        const totals = record.totals || {};
         const hasStats = (totals.totalTokens || totals.inputTokens || totals.outputTokens || totals.cachedTokens || totals.reasoningTokens || totals.requestCount);
         const titleClass = record.deleted ? 'token-account-name historical' : 'token-account-name';
         const subtitle = record.deleted ? `${service.name} · ${t('tokenStats.historyAccount')}` : service.name;
@@ -383,7 +567,18 @@ function createUsageRenderer({
       ? sections.join('')
       : `<div class="usage-card token-summary-card"><div class="usage-note">${t('tokenStats.noAccounts')}</div></div>`;
 
-    return `<div class="token-toolbar top"><button type="button" class="secondary" onclick="refreshTokenStatsPage()">${escapeHtml(t('tokenStats.refresh'))}</button></div>${summary}<div class="token-chart-gap">${chart}</div>${body}`;
+    return `${summary}<div class="token-chart-gap">${chart}</div>${body}`;
+  }
+
+  function renderTokenStatsPage({ state, historicalByProvider, services, expandedTokenAccounts, activePeriod = 'week', activeView = 'overview', dailyPage = 1, dailyDate = '', dailyAccount = '', dailyPageSize = 10 }) {
+    const stats = state && state.stats ? state.stats : {};
+    const content = activeView === 'dailySummary'
+      ? renderDailySummaryTable({ state, stats, dailyPage, dailyDate, dailyPageSize })
+      : activeView === 'daily'
+        ? renderDailyDetailsTable({ state, stats, services, dailyPage, dailyDate, dailyAccount, dailyPageSize })
+        : renderTokenStatsOverview({ state, historicalByProvider, services, expandedTokenAccounts, activePeriod });
+
+    return `<div class="token-toolbar top"><div class="token-toolbar-left">${renderTokenStatsViewTabs(activeView)}</div><button type="button" class="secondary" onclick="refreshTokenStatsPage()">${escapeHtml(t('tokenStats.refresh'))}</button></div>${content}`;
   }
 
   return {

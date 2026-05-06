@@ -128,8 +128,19 @@ function buildDisabledOAuthProviders({ oauthProviderKeys, isProviderEnabled }) {
   return disabledProviders.sort();
 }
 
-function composeRuntimeConfig({ baseRoot, disabledProviders, zaiKeys, zaiEnabled }) {
+function composeRuntimeConfig({ baseRoot, disabledProviders, zaiKeys, zaiEnabled, managementSecretKey }) {
   const mergedRoot = deepClone(baseRoot);
+
+  if (managementSecretKey) {
+    const remoteManagement = isPlainObject(mergedRoot['remote-management'])
+      ? deepClone(mergedRoot['remote-management'])
+      : {};
+    mergedRoot['remote-management'] = {
+      ...remoteManagement,
+      'allow-remote': false,
+      'secret-key': managementSecretKey
+    };
+  }
 
   const oauthExcludedModels = isPlainObject(mergedRoot['oauth-excluded-models'])
     ? deepClone(mergedRoot['oauth-excluded-models'])

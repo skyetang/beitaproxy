@@ -31,6 +31,11 @@ const temporaryTokenStates = {};
 const accountDetailTabs = {};
 let tokenStatsState = { loading: false, error: null, stats: null };
 let tokenStatsPeriod = 'week';
+let tokenStatsView = 'overview';
+let tokenStatsDailyPage = 1;
+let tokenStatsDailyDate = '';
+let tokenStatsDailyAccount = '';
+const TOKEN_STATS_DAILY_PAGE_SIZE = 10;
 const codexLocalAuthPath = vp.getCodexLocalAuthPath ? vp.getCodexLocalAuthPath() : '~/.codex/auth.json';
 
 const { renderUsageState, renderTokenStatsPage, renderTemporaryTokenState } = createUsageRenderer({
@@ -169,13 +174,43 @@ function renderTokenStatsPanel() {
     historicalByProvider: (tokenStatsState.stats && tokenStatsState.stats.historicalByProvider) || {},
     services: SERVICES,
     expandedTokenAccounts,
-    activePeriod: tokenStatsPeriod
+    activePeriod: tokenStatsPeriod,
+    activeView: tokenStatsView,
+    dailyPage: tokenStatsDailyPage,
+    dailyDate: tokenStatsDailyDate,
+    dailyAccount: tokenStatsDailyAccount,
+    dailyPageSize: TOKEN_STATS_DAILY_PAGE_SIZE
   });
 }
 
 function setTokenStatsPeriod(period) {
   if (period !== 'day' && period !== 'week' && period !== 'month') return;
   tokenStatsPeriod = period;
+  renderTokenStatsPanel();
+}
+
+function setTokenStatsView(view) {
+  if (view !== 'overview' && view !== 'dailySummary' && view !== 'daily') return;
+  tokenStatsView = view;
+  renderTokenStatsPanel();
+}
+
+function setTokenStatsDailyDate(value) {
+  tokenStatsDailyDate = String(value || '').trim();
+  tokenStatsDailyPage = 1;
+  renderTokenStatsPanel();
+}
+
+function setTokenStatsDailyAccount(value) {
+  tokenStatsDailyAccount = String(value || '').trim();
+  tokenStatsDailyPage = 1;
+  renderTokenStatsPanel();
+}
+
+function setTokenStatsDailyPage(page) {
+  const nextPage = Number(page);
+  if (!Number.isFinite(nextPage)) return;
+  tokenStatsDailyPage = Math.max(1, Math.floor(nextPage));
   renderTokenStatsPanel();
 }
 
@@ -504,6 +539,10 @@ Object.assign(window, {
   removeAccountById,
   refreshTokenStatsPage,
   setTokenStatsPeriod,
+  setTokenStatsView,
+  setTokenStatsDailyDate,
+  setTokenStatsDailyAccount,
+  setTokenStatsDailyPage,
   setAccountDetailTab,
   toggleTokenAccountExpand,
   toggleAccountDetails,
