@@ -307,14 +307,19 @@ function listAuthAccountEntries(serviceType = null) {
       try {
         const filePath = path.join(AUTH_DIR, file);
         const data = readAuthFile(filePath);
+        const stat = fs.statSync(filePath);
         const mappedType = mapAuthTypeToService(data.type);
         if (!mappedType) continue;
         if (serviceType && mappedType !== serviceType) continue;
+        const createdAt = stat && Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0
+          ? stat.birthtime.toISOString()
+          : (stat && stat.mtime ? stat.mtime.toISOString() : null);
 
         entries.push({
           id: file,
           filePath,
           type: mappedType,
+          createdAt,
           data
         });
       } catch (e) {}
@@ -1004,6 +1009,9 @@ function deleteAccount(filePath) {
       }
       if (temporaryKey) {
         delete store.temporaryAccounts[temporaryKey];
+        if (store.temporaryAccountResets) {
+          delete store.temporaryAccountResets[temporaryKey];
+        }
       }
       writeTokenStatsStore(store);
     }
@@ -1022,7 +1030,21 @@ function resetTemporaryTokenStats(temporaryKey) {
       return { success: false, error: 'Temporary token key is required' };
     }
     const store = readTokenStatsStore();
+    const now = new Date();
+    const resetAt = now.toISOString();
+    const resetDay = getLocalDayKey(now);
+    const statsKey = findStatsKeyByTemporaryKey(store, temporaryKey);
+    const baseline = statsKey
+      ? getDailyAccountBreakdown(store, resetDay, statsKey)
+      : createEmptyTokenBreakdown();
+
+    store.temporaryAccountResets = store.temporaryAccountResets || {};
     store.temporaryAccounts[temporaryKey] = createEmptyTokenBreakdown();
+    store.temporaryAccountResets[temporaryKey] = {
+      resetAt,
+      resetDay,
+      baseline
+    };
     store.updatedAt = new Date().toISOString();
     writeTokenStatsStore(store);
     return { success: true, stats: buildTokenStatisticsPayload(store) };
@@ -1210,7 +1232,13 @@ function buildAccountStatsKey(entry) {
   if (!entry) return null;
   const data = entry.data || {};
   const normalizedType = String(entry.type || mapAuthTypeToService(data.type) || '').trim().toLowerCase();
-  const normalizedAccountId = String(data.account_id || '').trim().toLowerCase();
+  const normalizedAccountId = String(
+    data.account_id
+      || data.accountId
+      || data.chatgpt_account_id
+      || data.chatgptAccountId
+      || ''
+  ).trim().toLowerCase();
   const normalizedEmail = String(data.email || data.login || '').trim().toLowerCase();
   return [normalizedType, normalizedAccountId || normalizedEmail || entry.id].join('::');
 }
@@ -1294,8 +1322,12 @@ function findAccountEntryByAccountId(provider, accountId) {
   if (!provider || !normalizedAccountId) return null;
   return listAuthAccountEntries(provider).find((entry) => {
     const data = entry.data || {};
-    return data.disabled !== true
-      && String(data.account_id || '').trim().toLowerCase() === normalizedAccountId;
+    return [
+      data.account_id,
+      data.accountId,
+      data.chatgpt_account_id,
+      data.chatgptAccountId
+    ].some((value) => String(value || '').trim().toLowerCase() === normalizedAccountId);
   }) || null;
 }
 
@@ -1409,6 +1441,7 @@ function createEmptyTokenStatsStore() {
     global: createEmptyTokenBreakdown(),
     accounts: {},
     temporaryAccounts: {},
+    temporaryAccountResets: {},
     accountMeta: {},
     daily: {},
     providerSnapshots: {}
@@ -1460,8 +1493,8 @@ function ensureAccountMeta(store, entry, options = {}) {
     provider: entry ? entry.type : (options.provider || existing.provider || null),
     email: data.email || existing.email || null,
     login: data.login || existing.login || null,
-    accountId: data.account_id || existing.accountId || null,
-    firstSeenAt: existing.firstSeenAt || now,
+    accountId: data.account_id || data.accountId || data.chatgpt_account_id || data.chatgptAccountId || existing.accountId || null,
+    firstSeenAt: existing.firstSeenAt || data.created_at || data.createdAt || (entry && entry.createdAt) || now,
     lastSeenAt: now,
     lastKnownAccountId: entry ? entry.id : (options.lastKnownAccountId || existing.lastKnownAccountId || null),
     deletedAt: options.deleted ? (existing.deletedAt || now) : null
@@ -1475,6 +1508,104 @@ function ensureTemporaryAccountStats(store, temporaryKey) {
   if (store.temporaryAccounts[temporaryKey]) return false;
   store.temporaryAccounts[temporaryKey] = createEmptyTokenBreakdown();
   return true;
+}
+
+function normalizeTemporaryAccountResetMap(value) {
+  const next = {};
+  for (const [temporaryKey, resetState] of Object.entries(value || {})) {
+    const resetAt = typeof resetState === 'string'
+      ? resetState
+      : (resetState && (resetState.resetAt || resetState.updatedAt || resetState.at));
+    if (!resetAt) continue;
+
+    const resetDate = new Date(resetAt);
+    if (Number.isNaN(resetDate.getTime())) continue;
+
+    next[temporaryKey] = {
+      resetAt: resetDate.toISOString(),
+      resetDay: (resetState && resetState.resetDay) || getLocalDayKey(resetDate),
+      baseline: mergeTokenBreakdowns(createEmptyTokenBreakdown(), (resetState && resetState.baseline) || {})
+    };
+  }
+  return next;
+}
+
+function getTemporaryAccountResetState(store, temporaryKey) {
+  if (!temporaryKey) return null;
+  const resetState = store.temporaryAccountResets && store.temporaryAccountResets[temporaryKey];
+  if (!resetState || !resetState.resetAt) return null;
+  return resetState;
+}
+
+function getDailyAccountBreakdown(store, dayKey, statsKey) {
+  const dayEntry = store.daily && store.daily[dayKey];
+  return dayEntry && dayEntry.accounts && dayEntry.accounts[statsKey]
+    ? mergeTokenBreakdowns(createEmptyTokenBreakdown(), dayEntry.accounts[statsKey])
+    : createEmptyTokenBreakdown();
+}
+
+function sumAccountDailyTotals(store, statsKey, options = {}) {
+  const totals = createEmptyTokenBreakdown();
+  let hasSource = false;
+  if (!statsKey) return { totals, hasSource };
+
+  for (const [dayKey, dayEntry] of Object.entries(store.daily || {})) {
+    if (options.fromDay && String(dayKey) < String(options.fromDay)) continue;
+    const source = dayEntry && dayEntry.accounts && dayEntry.accounts[statsKey];
+    if (!source) continue;
+    hasSource = true;
+    const merged = mergeTokenBreakdowns(totals, source);
+    totals.inputTokens = merged.inputTokens;
+    totals.outputTokens = merged.outputTokens;
+    totals.cachedTokens = merged.cachedTokens;
+    totals.reasoningTokens = merged.reasoningTokens;
+    totals.totalTokens = merged.totalTokens;
+    totals.requestCount = merged.requestCount;
+  }
+
+  return { totals, hasSource };
+}
+
+function getAccountTotalsFromSource(store, statsKey) {
+  const dailyTotals = sumAccountDailyTotals(store, statsKey);
+  if (dailyTotals.hasSource) return dailyTotals.totals;
+  return mergeTokenBreakdowns(createEmptyTokenBreakdown(), (store.accounts && store.accounts[statsKey]) || {});
+}
+
+function getMetaStartDay(meta) {
+  const startAt = meta && meta.firstSeenAt;
+  if (!startAt) return null;
+  const startDate = new Date(startAt);
+  return Number.isNaN(startDate.getTime()) ? null : getLocalDayKey(startDate);
+}
+
+function buildTemporaryAccountStats(store, statsKey, temporaryKey) {
+  const resetState = getTemporaryAccountResetState(store, temporaryKey);
+  if (!resetState) {
+    const startDay = getMetaStartDay(store.accountMeta && store.accountMeta[statsKey]);
+    const dailyTotals = sumAccountDailyTotals(store, statsKey, startDay ? { fromDay: startDay } : {});
+    if (dailyTotals.hasSource) return dailyTotals.totals;
+    const accountTotals = mergeTokenBreakdowns(createEmptyTokenBreakdown(), (store.accounts && store.accounts[statsKey]) || {});
+    if (hasTokenBreakdownStats(accountTotals)) return accountTotals;
+    return mergeTokenBreakdowns(createEmptyTokenBreakdown(), (store.temporaryAccounts && store.temporaryAccounts[temporaryKey]) || {});
+  }
+
+  const dailyTotals = sumAccountDailyTotals(store, statsKey, { fromDay: resetState.resetDay });
+  return subtractTokenBreakdowns(dailyTotals.totals, resetState.baseline || createEmptyTokenBreakdown());
+}
+
+function findStatsKeyByTemporaryKey(store, temporaryKey) {
+  for (const [statsKey, meta] of Object.entries(store.accountMeta || {})) {
+    if (meta && meta.temporaryKey === temporaryKey) return statsKey;
+  }
+  for (const entry of listAuthAccountEntries()) {
+    if (buildTemporaryStatsKey(entry) === temporaryKey) {
+      const statsKey = buildAccountStatsKey(entry);
+      ensureAccountMeta(store, entry, { statsKey, temporaryKey });
+      return statsKey;
+    }
+  }
+  return null;
 }
 
 function mergeBreakdownEntries(recordMap) {
@@ -1523,17 +1654,24 @@ function reconcileTokenStatsStore(store) {
     dayEntry.global = maxTokenBreakdowns(dayEntry.global || createEmptyTokenBreakdown(), accountTotals);
   }
 
-  const statsKeys = new Set([
-    ...Object.keys(store.accounts || {}),
-    ...Object.values(store.daily || {}).flatMap((dayEntry) => Object.keys((dayEntry && dayEntry.accounts) || {}))
-  ]);
-  for (const statsKey of statsKeys) {
-    store.accounts[statsKey] = maxTokenBreakdowns(store.accounts[statsKey] || createEmptyTokenBreakdown(), sumStoreDailyTotals(store, statsKey));
+  const legacyAccounts = mergeBreakdownEntries(store.accounts || {});
+  const dailyStatsKeys = new Set(
+    Object.values(store.daily || {}).flatMap((dayEntry) => Object.keys((dayEntry && dayEntry.accounts) || {}))
+  );
+  const nextAccounts = {};
+  for (const statsKey of dailyStatsKeys) {
+    nextAccounts[statsKey] = sumStoreDailyTotals(store, statsKey);
   }
+  for (const [statsKey, totals] of Object.entries(legacyAccounts)) {
+    if (!nextAccounts[statsKey]) {
+      nextAccounts[statsKey] = totals;
+    }
+  }
+  store.accounts = nextAccounts;
 
   const accountTotals = Object.values(store.accounts || {})
     .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
-  store.global = maxTokenBreakdowns(store.global || createEmptyTokenBreakdown(), sumStoreDailyTotals(store, null));
+  store.global = sumStoreDailyTotals(store, null);
   store.global = maxTokenBreakdowns(store.global, accountTotals);
   return store;
 }
@@ -1676,11 +1814,11 @@ function buildTokenStatisticsPayload(store) {
   const historicalByProvider = {};
 
   for (const account of currentAccounts) {
-    const storedTotals = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.accounts[account.statsKey] || {});
+    const storedTotals = getAccountTotalsFromSource(store, account.statsKey);
     ensureTemporaryAccountStats(store, account.temporaryKey);
-    const temporary = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.temporaryAccounts[account.temporaryKey] || {});
+    const temporary = buildTemporaryAccountStats(store, account.statsKey, account.temporaryKey);
     temporaryAccounts[account.temporaryKey] = temporary;
-    currentStatsById[account.id] = hasTokenBreakdownStats(storedTotals) ? storedTotals : temporary;
+    currentStatsById[account.id] = storedTotals;
   }
 
   const statsKeys = new Set([
@@ -1693,9 +1831,8 @@ function buildTokenStatisticsPayload(store) {
     const activeAccount = currentAccounts.find((account) => account.statsKey === statsKey) || null;
     const provider = meta.provider || (activeAccount && activeAccount.type) || String(statsKey.split('::')[0] || 'unknown');
     const temporaryKey = activeAccount ? activeAccount.temporaryKey : meta.temporaryKey;
-    const temporary = temporaryKey ? mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.temporaryAccounts[temporaryKey] || {}) : createEmptyTokenBreakdown();
-    const storedTotals = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.accounts[statsKey] || {});
-    const totals = hasTokenBreakdownStats(storedTotals) ? storedTotals : temporary;
+    const temporary = temporaryKey ? buildTemporaryAccountStats(store, statsKey, temporaryKey) : createEmptyTokenBreakdown();
+    const totals = getAccountTotalsFromSource(store, statsKey);
     const history = buildHistorySeries(store, [statsKey]);
     const periodStats = buildPeriodStats(store, [statsKey]);
     const record = {
@@ -1733,6 +1870,7 @@ function buildTokenStatisticsPayload(store) {
     global: mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.global || {}),
     accounts: currentStatsById,
     temporaryAccounts,
+    temporaryAccountResets: store.temporaryAccountResets || {},
     historicalAccounts,
     historicalByProvider,
     periods: buildPeriodStats(store, null),
@@ -1995,6 +2133,7 @@ function readTokenStatsStore() {
     store.global = mergeTokenBreakdowns(createEmptyTokenBreakdown(), parsed.global || {});
     store.accounts = mergeBreakdownEntries(parsed.accounts || {});
     store.temporaryAccounts = mergeBreakdownEntries(parsed.temporaryAccounts || {});
+    store.temporaryAccountResets = normalizeTemporaryAccountResetMap(parsed.temporaryAccountResets || {});
     store.accountMeta = normalizeAccountMetaMap(parsed.accountMeta || {});
     store.daily = normalizeDailyMap(parsed.daily || {});
     store.providerSnapshots = parsed.providerSnapshots && typeof parsed.providerSnapshots === 'object' ? parsed.providerSnapshots : {};
@@ -2038,11 +2177,8 @@ function recordTokenUsage(statsKey, usage, options = {}) {
   const now = new Date();
   const dayKey = getLocalDayKey(now);
   const updatedAt = now.toISOString();
-  store.accounts[statsKey] = mergeTokenBreakdowns(store.accounts[statsKey] || createEmptyTokenBreakdown(), normalizedUsage);
-  store.global = mergeTokenBreakdowns(store.global || createEmptyTokenBreakdown(), normalizedUsage);
   if (options.temporaryKey) {
     ensureTemporaryAccountStats(store, options.temporaryKey);
-    store.temporaryAccounts[options.temporaryKey] = mergeTokenBreakdowns(store.temporaryAccounts[options.temporaryKey] || createEmptyTokenBreakdown(), normalizedUsage);
   }
   addUsageToDailyStore(store, dayKey, statsKey, normalizedUsage);
   if (options.entry) {
@@ -2052,6 +2188,7 @@ function recordTokenUsage(statsKey, usage, options = {}) {
     });
   }
   store.updatedAt = updatedAt;
+  reconcileTokenStatsStore(store);
   writeTokenStatsStore(store);
 }
 
@@ -2130,8 +2267,6 @@ function updateSnapshotTotals(store, previousSnapshot, nextSnapshot, statsKey, o
   if (!delta.totalTokens && !delta.inputTokens && !delta.outputTokens && !delta.cachedTokens && !delta.reasoningTokens) {
     return false;
   }
-  store.accounts[statsKey] = mergeTokenBreakdowns(store.accounts[statsKey] || createEmptyTokenBreakdown(), delta);
-  store.global = mergeTokenBreakdowns(store.global || createEmptyTokenBreakdown(), delta);
   addUsageToDailyStore(store, getLocalDayKey(), statsKey, delta);
   if (options.entry) {
     ensureAccountMeta(store, options.entry, {
@@ -2139,6 +2274,7 @@ function updateSnapshotTotals(store, previousSnapshot, nextSnapshot, statsKey, o
       temporaryKey: options.temporaryKey
     });
   }
+  reconcileTokenStatsStore(store);
   return true;
 }
 
@@ -2599,13 +2735,25 @@ function sumStoreDailyTotals(store, statsKey = null) {
   return totals;
 }
 
-function replaceDailyEntryFromCliProxyDetails(store, dayKey, sourceDayEntry) {
+function mergeDailyEntryFromCliProxyDetails(store, dayKey, sourceDayEntry) {
   const previousDayEntry = normalizeDailyEntry((store.daily || {})[dayKey] || null);
-  const nextDayEntry = normalizeDailyEntry(sourceDayEntry || null);
-  const affectedStatsKeys = new Set([
-    ...Object.keys(previousDayEntry.accounts || {}),
-    ...Object.keys(nextDayEntry.accounts || {})
-  ]);
+  const sourceNextDayEntry = normalizeDailyEntry(sourceDayEntry || null);
+  const mergedAccounts = { ...(previousDayEntry.accounts || {}) };
+  const affectedStatsKeys = new Set(Object.keys(sourceNextDayEntry.accounts || {}));
+
+  // Management usage details can omit disabled or no-longer-visible accounts.
+  // Treat returned account/day rows as refreshes, not as proof missing rows are zero.
+  for (const [statsKey, totals] of Object.entries(sourceNextDayEntry.accounts || {})) {
+    mergedAccounts[statsKey] = maxTokenBreakdowns(
+      previousDayEntry.accounts[statsKey] || createEmptyTokenBreakdown(),
+      totals || createEmptyTokenBreakdown()
+    );
+  }
+
+  const nextDayEntry = normalizeDailyEntry({
+    global: maxTokenBreakdowns(previousDayEntry.global, sourceNextDayEntry.global),
+    accounts: mergedAccounts
+  });
 
   store.daily[dayKey] = nextDayEntry;
   store.global = mergeTokenBreakdowns(
@@ -2633,7 +2781,7 @@ function applyCliProxyDetailedStore(store, detailedStore, authoritativeDayKeys =
       target.global = maxTokenBreakdowns(target.global || createEmptyTokenBreakdown(), (dayEntry && dayEntry.global) || createEmptyTokenBreakdown());
       continue;
     }
-    replaceDailyEntryFromCliProxyDetails(store, dayKey, dayEntry);
+    mergeDailyEntryFromCliProxyDetails(store, dayKey, dayEntry);
   }
   store.global = maxTokenBreakdowns(store.global || createEmptyTokenBreakdown(), sumStoreDailyTotals(store, null));
   store.global = maxTokenBreakdowns(store.global, detailedStore.global || createEmptyTokenBreakdown());
@@ -2709,6 +2857,7 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
       }
     };
     store.updatedAt = now;
+    reconcileTokenStatsStore(store);
     return { success: true, detailed: true, detailCount: events.length, attributedCount };
   }
 
@@ -2726,6 +2875,7 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
       }
     };
     store.updatedAt = now;
+    reconcileTokenStatsStore(store);
     return { success: true, detailed: false, aggregate: true };
   }
 
