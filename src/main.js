@@ -2253,31 +2253,6 @@ function extractKimiUsageSnapshot(payload) {
   };
 }
 
-function updateSnapshotTotals(store, previousSnapshot, nextSnapshot, statsKey, options = {}) {
-  const previous = mergeTokenBreakdowns(createEmptyTokenBreakdown(), previousSnapshot || {});
-  const next = mergeTokenBreakdowns(createEmptyTokenBreakdown(), nextSnapshot || {});
-  const delta = {
-    inputTokens: Math.max(0, next.inputTokens - previous.inputTokens),
-    outputTokens: Math.max(0, next.outputTokens - previous.outputTokens),
-    cachedTokens: Math.max(0, next.cachedTokens - previous.cachedTokens),
-    reasoningTokens: Math.max(0, next.reasoningTokens - previous.reasoningTokens),
-    totalTokens: Math.max(0, next.totalTokens - previous.totalTokens),
-    requestCount: 0
-  };
-  if (!delta.totalTokens && !delta.inputTokens && !delta.outputTokens && !delta.cachedTokens && !delta.reasoningTokens) {
-    return false;
-  }
-  addUsageToDailyStore(store, getLocalDayKey(), statsKey, delta);
-  if (options.entry) {
-    ensureAccountMeta(store, options.entry, {
-      statsKey,
-      temporaryKey: options.temporaryKey
-    });
-  }
-  reconcileTokenStatsStore(store);
-  return true;
-}
-
 function fetchJsonWithElectronNet({ url, headers = {}, timeoutMs = 15000 }) {
   return new Promise((resolve) => {
     try {
@@ -3011,13 +2986,6 @@ async function refreshTokenStatistics() {
 
       if (!snapshotKey) continue;
       if (snapshot) {
-        const previousSnapshot = store.providerSnapshots[snapshotKey] || null;
-        if (previousSnapshot) {
-          updateSnapshotTotals(store, previousSnapshot, snapshot, statsKey, {
-            entry,
-            temporaryKey
-          });
-        }
         store.providerSnapshots[snapshotKey] = snapshot;
         store.updatedAt = new Date().toISOString();
       }
