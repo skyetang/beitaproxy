@@ -35,6 +35,7 @@ const CODEX_LOCAL_AUTH_FILE = path.join(os.homedir(), '.codex', 'auth.json');
 const APP_VERSION = '1.0.1';
 const CONFIG_FILE = path.join(AUTH_DIR, 'beitaproxy-config.json');
 const TOKEN_STATS_FILE = path.join(app.getPath('userData'), 'token-stats.json');
+const TOKEN_STATS_BACKUP_FILE = `${TOKEN_STATS_FILE}.bak`;
 const STARTUP_READINESS_TIMEOUT_MS = 15000;
 const STOP_TIMEOUT_MS = 4000;
 const OBSERVED_INPUTS_DEBOUNCE_MS = 400;
@@ -60,6 +61,7 @@ let activeManagementSecretKey = null;
 let tokenStatsSyncTimer = null;
 let tokenStatsSyncInFlight = false;
 let tokenStatsSyncPending = false;
+let tokenStatsSyncActivePromise = null;
 let tokenStatsStoreQueue = Promise.resolve();
 
 // OAuth provider keys mapping (same as Swift version)
@@ -1780,6 +1782,7 @@ function normalizeDailyEntry(entry) {
 }
 
 function reconcileTokenStatsStore(store) {
+  const legacyGlobal = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.global || {});
   for (const dayEntry of Object.values(store.daily || {})) {
     const accountTotals = Object.values((dayEntry && dayEntry.accounts) || {})
       .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
@@ -1803,8 +1806,10 @@ function reconcileTokenStatsStore(store) {
 
   const accountTotals = Object.values(store.accounts || {})
     .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
-  store.global = sumStoreDailyTotals(store, null);
-  store.global = maxTokenBreakdowns(store.global, accountTotals);
+  const dailyTotals = sumStoreDailyTotals(store, null);
+  store.global = hasTokenBreakdownValue(dailyTotals) || hasTokenBreakdownValue(accountTotals)
+    ? maxTokenBreakdowns(dailyTotals, accountTotals)
+    : legacyGlobal;
   return store;
 }
 
@@ -2170,44 +2175,60 @@ function normalizeUsageBlock(usage) {
   };
 }
 
-function readTokenStatsStore() {
-  try {
-    if (!fs.existsSync(TOKEN_STATS_FILE)) {
-      return createEmptyTokenStatsStore();
-    }
-    const parsed = JSON.parse(fs.readFileSync(TOKEN_STATS_FILE, 'utf8'));
-    const store = createEmptyTokenStatsStore();
-    store.updatedAt = parsed.updatedAt || null;
-    store.usageResetAt = normalizeIsoTimestamp(parsed.usageResetAt || null);
-    store.global = mergeTokenBreakdowns(createEmptyTokenBreakdown(), parsed.global || {});
-    store.accounts = mergeBreakdownEntries(parsed.accounts || {});
-    store.temporaryAccounts = mergeBreakdownEntries(parsed.temporaryAccounts || {});
-    store.temporaryAccountResets = normalizeTemporaryAccountResetMap(parsed.temporaryAccountResets || {});
-    store.accountMeta = normalizeAccountMetaMap(parsed.accountMeta || {});
-    store.daily = normalizeDailyMap(parsed.daily || {});
-    store.usageEvents = normalizeUsageEventIndex(parsed.usageEvents || {});
-    store.providerSnapshots = parsed.providerSnapshots && typeof parsed.providerSnapshots === 'object' ? parsed.providerSnapshots : {};
+function normalizeTokenStatsStorePayload(parsed) {
+  const store = createEmptyTokenStatsStore();
+  store.updatedAt = parsed.updatedAt || null;
+  store.usageResetAt = normalizeIsoTimestamp(parsed.usageResetAt || null);
+  store.global = mergeTokenBreakdowns(createEmptyTokenBreakdown(), parsed.global || {});
+  store.accounts = mergeBreakdownEntries(parsed.accounts || {});
+  store.temporaryAccounts = mergeBreakdownEntries(parsed.temporaryAccounts || {});
+  store.temporaryAccountResets = normalizeTemporaryAccountResetMap(parsed.temporaryAccountResets || {});
+  store.accountMeta = normalizeAccountMetaMap(parsed.accountMeta || {});
+  store.daily = normalizeDailyMap(parsed.daily || {});
+  store.usageEvents = normalizeUsageEventIndex(parsed.usageEvents || {});
+  store.providerSnapshots = parsed.providerSnapshots && typeof parsed.providerSnapshots === 'object' ? parsed.providerSnapshots : {};
 
-    if (parsed.version === 1) {
-      for (const statsKey of Object.keys(store.accounts)) {
-        if (!store.accountMeta[statsKey]) {
-          const parts = statsKey.split('::');
-          store.accountMeta[statsKey] = {
-            ...createEmptyAccountMeta(),
-            statsKey,
-            provider: parts[0] || null,
-            email: parts.slice(1).join('::') || statsKey,
-            firstSeenAt: store.updatedAt,
-            lastSeenAt: store.updatedAt
-          };
-        }
+  if (parsed.version === 1) {
+    for (const statsKey of Object.keys(store.accounts)) {
+      if (!store.accountMeta[statsKey]) {
+        const parts = statsKey.split('::');
+        store.accountMeta[statsKey] = {
+          ...createEmptyAccountMeta(),
+          statsKey,
+          provider: parts[0] || null,
+          email: parts.slice(1).join('::') || statsKey,
+          firstSeenAt: store.updatedAt,
+          lastSeenAt: store.updatedAt
+        };
       }
     }
-
-    return reconcileTokenStatsStore(store);
-  } catch (e) {
-    return createEmptyTokenStatsStore();
   }
+
+  return reconcileTokenStatsStore(store);
+}
+
+function readTokenStatsStoreFile(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  return normalizeTokenStatsStorePayload(parsed);
+}
+
+function readTokenStatsStore() {
+  try {
+    const store = readTokenStatsStoreFile(TOKEN_STATS_FILE);
+    if (store) return store;
+  } catch (e) {
+    console.warn('[TokenStats] Failed to read primary token stats file:', e.message);
+  }
+
+  try {
+    const backupStore = readTokenStatsStoreFile(TOKEN_STATS_BACKUP_FILE);
+    if (backupStore) return backupStore;
+  } catch (e) {
+    console.warn('[TokenStats] Failed to read backup token stats file:', e.message);
+  }
+
+  return createEmptyTokenStatsStore();
 }
 
 function writeTokenStatsStore(store) {
@@ -2217,6 +2238,12 @@ function writeTokenStatsStore(store) {
     fs.writeFileSync(tempFile, JSON.stringify(store, null, 2), 'utf8');
     try { fs.chmodSync(tempFile, 0o600); } catch (e) {}
     fs.renameSync(tempFile, TOKEN_STATS_FILE);
+    try {
+      fs.copyFileSync(TOKEN_STATS_FILE, TOKEN_STATS_BACKUP_FILE);
+      try { fs.chmodSync(TOKEN_STATS_BACKUP_FILE, 0o600); } catch (e) {}
+    } catch (backupError) {
+      console.warn('[TokenStats] Failed to update token stats backup:', backupError.message);
+    }
   } catch (e) {
     try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch (cleanupError) {}
     throw e;
@@ -3030,30 +3057,34 @@ async function fetchCliProxyUsageSyncInputs() {
 async function runBackgroundTokenStatsSync() {
   if (tokenStatsSyncInFlight) {
     tokenStatsSyncPending = true;
-    return;
+    return tokenStatsSyncActivePromise || Promise.resolve();
   }
 
   tokenStatsSyncInFlight = true;
-  try {
-    await queueTokenStatsStoreUpdate(async () => {
-      const inputs = await fetchCliProxyUsageSyncInputs();
-      if (!inputs.success) {
-        return;
+  tokenStatsSyncActivePromise = (async () => {
+    try {
+      await queueTokenStatsStoreUpdate(async () => {
+        const inputs = await fetchCliProxyUsageSyncInputs();
+        if (!inputs.success) {
+          return;
+        }
+        const store = readTokenStatsStore();
+        const syncResult = syncCliProxyUsageStatistics(store, inputs.payload, inputs.authFiles);
+        if (syncResult.success) {
+          writeTokenStatsStore(store);
+        }
+      });
+    } catch (e) {
+    } finally {
+      tokenStatsSyncInFlight = false;
+      tokenStatsSyncActivePromise = null;
+      if (tokenStatsSyncPending) {
+        tokenStatsSyncPending = false;
+        scheduleBackgroundTokenStatsSync();
       }
-      const store = readTokenStatsStore();
-      const syncResult = syncCliProxyUsageStatistics(store, inputs.payload, inputs.authFiles);
-      if (syncResult.success) {
-        writeTokenStatsStore(store);
-      }
-    });
-  } catch (e) {
-  } finally {
-    tokenStatsSyncInFlight = false;
-    if (tokenStatsSyncPending) {
-      tokenStatsSyncPending = false;
-      scheduleBackgroundTokenStatsSync();
     }
-  }
+  })();
+  return tokenStatsSyncActivePromise;
 }
 
 function scheduleBackgroundTokenStatsSync() {
@@ -3064,6 +3095,19 @@ function scheduleBackgroundTokenStatsSync() {
     tokenStatsSyncTimer = null;
     runBackgroundTokenStatsSync();
   }, TOKEN_STATS_BACKGROUND_SYNC_DELAY_MS);
+}
+
+async function flushPendingTokenStatsSync() {
+  if (tokenStatsSyncTimer) {
+    clearTimeout(tokenStatsSyncTimer);
+    tokenStatsSyncTimer = null;
+  }
+  await runBackgroundTokenStatsSync();
+  if (tokenStatsSyncTimer) {
+    clearTimeout(tokenStatsSyncTimer);
+    tokenStatsSyncTimer = null;
+    await runBackgroundTokenStatsSync();
+  }
 }
 
 async function refreshTokenStatistics() {
@@ -3461,6 +3505,7 @@ async function startServerInternal() {
 
 async function stopServerInternal() {
   await stopThinkingProxy();
+  await flushPendingTokenStatsSync();
   await stopBackendServer();
   isServerRunning = false;
   updateTray();
