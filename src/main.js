@@ -36,6 +36,7 @@ const APP_VERSION = '1.0.1';
 const CONFIG_FILE = path.join(AUTH_DIR, 'beitaproxy-config.json');
 const TOKEN_STATS_FILE = path.join(app.getPath('userData'), 'token-stats.json');
 const TOKEN_STATS_STORE_VERSION = 3;
+const TOKEN_STATS_STORE_NEEDS_PERSIST = Symbol('tokenStatsStoreNeedsPersist');
 const STARTUP_READINESS_TIMEOUT_MS = 15000;
 const STOP_TIMEOUT_MS = 4000;
 const OBSERVED_INPUTS_DEBOUNCE_MS = 400;
@@ -1526,6 +1527,12 @@ function createResetTokenStatsStore(resetAt = new Date().toISOString()) {
   return store;
 }
 
+function createPersistedResetTokenStatsStore(resetAt = new Date().toISOString()) {
+  const store = createResetTokenStatsStore(resetAt);
+  store[TOKEN_STATS_STORE_NEEDS_PERSIST] = true;
+  return store;
+}
+
 function createEmptyAccountMeta() {
   return {
     statsKey: null,
@@ -2150,7 +2157,7 @@ function normalizeUsageBlock(usage) {
 
 function normalizeTokenStatsStorePayload(parsed) {
   if (!parsed || parsed.version !== TOKEN_STATS_STORE_VERSION) {
-    return createResetTokenStatsStore();
+    return createPersistedResetTokenStatsStore();
   }
 
   const store = createEmptyTokenStatsStore();
@@ -2170,13 +2177,21 @@ function readTokenStatsStoreFile(filePath) {
   return normalizeTokenStatsStorePayload(parsed);
 }
 
+function persistTokenStatsStoreIfNeeded(store) {
+  if (store && store[TOKEN_STATS_STORE_NEEDS_PERSIST]) {
+    delete store[TOKEN_STATS_STORE_NEEDS_PERSIST];
+    writeTokenStatsStore(store);
+  }
+  return store;
+}
+
 function readTokenStatsStore() {
   try {
     const store = readTokenStatsStoreFile(TOKEN_STATS_FILE);
-    if (store) return store;
+    if (store) return persistTokenStatsStoreIfNeeded(store);
   } catch (e) {
     console.warn('[TokenStats] Failed to read primary token stats file:', e.message);
-    return createResetTokenStatsStore();
+    return persistTokenStatsStoreIfNeeded(createPersistedResetTokenStatsStore());
   }
 
   return createEmptyTokenStatsStore();
