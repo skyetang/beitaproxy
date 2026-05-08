@@ -1035,8 +1035,8 @@ async function resetTemporaryTokenStats(temporaryKey) {
       return { success: false, error: 'Temporary token key is required' };
     }
     return await queueTokenStatsStoreUpdate(async () => {
-      const syncInputs = await fetchCliProxyUsageSyncInputs().catch(() => null);
       const store = readTokenStatsStore();
+      const syncInputs = await fetchCliProxyUsageSyncInputs().catch(() => null);
       if (syncInputs && syncInputs.success) {
         syncCliProxyUsageStatistics(store, syncInputs.payload, syncInputs.authFiles);
       }
@@ -2180,7 +2180,11 @@ function readTokenStatsStoreFile(filePath) {
 function persistTokenStatsStoreIfNeeded(store) {
   if (store && store[TOKEN_STATS_STORE_NEEDS_PERSIST]) {
     delete store[TOKEN_STATS_STORE_NEEDS_PERSIST];
-    writeTokenStatsStore(store);
+    try {
+      writeTokenStatsStore(store);
+    } catch (e) {
+      console.warn('[TokenStats] Failed to persist token stats reset boundary:', e.message);
+    }
   }
   return store;
 }
@@ -2194,7 +2198,7 @@ function readTokenStatsStore() {
     return persistTokenStatsStoreIfNeeded(createPersistedResetTokenStatsStore());
   }
 
-  return createEmptyTokenStatsStore();
+  return persistTokenStatsStoreIfNeeded(createPersistedResetTokenStatsStore());
 }
 
 function writeTokenStatsStore(store) {
@@ -2877,11 +2881,11 @@ async function runBackgroundTokenStatsSync() {
   tokenStatsSyncActivePromise = (async () => {
     try {
       await queueTokenStatsStoreUpdate(async () => {
+        const store = readTokenStatsStore();
         const inputs = await fetchCliProxyUsageSyncInputs();
         if (!inputs.success) {
           return;
         }
-        const store = readTokenStatsStore();
         const syncResult = syncCliProxyUsageStatistics(store, inputs.payload, inputs.authFiles);
         if (syncResult.success) {
           writeTokenStatsStore(store);
@@ -2927,13 +2931,12 @@ async function refreshTokenStatistics() {
   try {
     return await queueTokenStatsStoreUpdate(async () => {
       const entries = listAuthAccountEntries();
+      const store = readTokenStatsStore();
+      ensureTokenStatsAccountMetadata(store, entries);
       const cliProxyInputs = await fetchCliProxyUsageSyncInputs().catch((error) => ({
         success: false,
         error: error && error.message ? error.message : 'Usage sync failed'
       }));
-
-      const store = readTokenStatsStore();
-      ensureTokenStatsAccountMetadata(store, entries);
 
       if (cliProxyInputs.success) {
         syncCliProxyUsageStatistics(store, cliProxyInputs.payload, cliProxyInputs.authFiles);
@@ -3636,6 +3639,7 @@ app.whenReady().then(async () => {
   loadLaunchAtLogin();
   ensureAuthDir();
   getConfigPath();
+  readTokenStatsStore();
   startObservedInputMonitoring();
   await applyNetworkProxy();
   createTray();
