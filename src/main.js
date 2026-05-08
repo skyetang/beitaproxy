@@ -1288,8 +1288,15 @@ function mergeTemporaryStatsAlias(store, fromTemporaryKey, toTemporaryKey) {
   }
   const fromReset = store.temporaryAccountResets && store.temporaryAccountResets[fromTemporaryKey];
   if (fromReset) {
-    if (!store.temporaryAccountResets[toTemporaryKey]) {
+    const toReset = store.temporaryAccountResets[toTemporaryKey];
+    if (!toReset) {
       store.temporaryAccountResets[toTemporaryKey] = fromReset;
+    } else {
+      const fromTime = new Date(fromReset.resetAt || 0).getTime();
+      const toTime = new Date(toReset.resetAt || 0).getTime();
+      if (Number.isFinite(fromTime) && (!Number.isFinite(toTime) || fromTime > toTime)) {
+        store.temporaryAccountResets[toTemporaryKey] = fromReset;
+      }
     }
     delete store.temporaryAccountResets[fromTemporaryKey];
   }
@@ -1337,6 +1344,10 @@ function mergeAccountStatsAliases(store, entry, entries = []) {
   if (!store || !entry || !canonicalStatsKey) return;
   const canonicalTemporaryKey = buildTemporaryStatsKey(entry);
   const candidates = buildAccountStatsKeyCandidates(entry);
+  const data = entry.data || {};
+  const canonicalProvider = normalizeIdentityValue(entry.type || mapAuthTypeToService(data.type));
+  const canonicalAccountId = normalizeIdentityValue(data.account_id || data.accountId || data.chatgpt_account_id || data.chatgptAccountId);
+  const canonicalIdentity = normalizeIdentityValue(data.email || data.login);
   for (const candidate of candidates) {
     if (!candidate || candidate === canonicalStatsKey) continue;
     const sharedCandidate = entries.some((otherEntry) => (
@@ -1345,6 +1356,15 @@ function mergeAccountStatsAliases(store, entry, entries = []) {
         && buildAccountStatsKeyCandidates(otherEntry).includes(candidate)
     ));
     if (sharedCandidate) continue;
+    const candidateMeta = store.accountMeta && store.accountMeta[candidate];
+    if (candidateMeta) {
+      const candidateProvider = normalizeIdentityValue(candidateMeta.provider);
+      const candidateAccountId = normalizeIdentityValue(candidateMeta.accountId);
+      const candidateIdentity = normalizeIdentityValue(candidateMeta.email || candidateMeta.login);
+      if (candidateProvider && canonicalProvider && candidateProvider !== canonicalProvider) continue;
+      if (candidateAccountId && canonicalAccountId && candidateAccountId !== canonicalAccountId) continue;
+      if (candidateIdentity && canonicalIdentity && candidateIdentity !== canonicalIdentity) continue;
+    }
     mergeAccountStatsKey(store, candidate, canonicalStatsKey);
     mergeTemporaryStatsAlias(store, `${entry.id}::${candidate}`, canonicalTemporaryKey);
   }
@@ -1624,6 +1644,15 @@ function addUsageToTemporaryResetBaselineIfNeeded(store, temporaryKey, detail, d
   const resetAt = normalizeIsoTimestamp(resetState.resetAt);
   if (!usageDate || !resetAt || usageDate.getTime() > new Date(resetAt).getTime()) return;
   resetState.baseline = mergeTokenBreakdowns(resetState.baseline || createEmptyTokenBreakdown(), usage || {});
+}
+
+function subtractUsageFromTemporaryResetBaselineIfNeeded(store, temporaryKey, detail, dayKey, usage) {
+  const resetState = getTemporaryAccountResetState(store, temporaryKey);
+  if (!resetState || resetState.resetDay !== dayKey) return;
+  const usageDate = getCliProxyUsageDetailDate(detail);
+  const resetAt = normalizeIsoTimestamp(resetState.resetAt);
+  if (!usageDate || !resetAt || usageDate.getTime() > new Date(resetAt).getTime()) return;
+  resetState.baseline = subtractTokenBreakdowns(resetState.baseline || createEmptyTokenBreakdown(), usage || {});
 }
 
 function sumAccountDailyTotals(store, statsKey, options = {}) {
@@ -2183,7 +2212,15 @@ function readTokenStatsStore() {
 
 function writeTokenStatsStore(store) {
   ensureParentDir(TOKEN_STATS_FILE);
-  fs.writeFileSync(TOKEN_STATS_FILE, JSON.stringify(store, null, 2), 'utf8');
+  const tempFile = `${TOKEN_STATS_FILE}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tempFile, JSON.stringify(store, null, 2), 'utf8');
+    try { fs.chmodSync(tempFile, 0o600); } catch (e) {}
+    fs.renameSync(tempFile, TOKEN_STATS_FILE);
+  } catch (e) {
+    try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch (cleanupError) {}
+    throw e;
+  }
   try { fs.chmodSync(TOKEN_STATS_FILE, 0o600); } catch (e) {}
 }
 
@@ -2545,6 +2582,44 @@ function hashUsageEventIdentity(identity) {
   return crypto.createHash('sha256').update(JSON.stringify(stableJsonValue(identity))).digest('hex');
 }
 
+function getUsageDetailEndpoint(detail) {
+  return stringifyIdentifier(
+    detail.endpoint
+      ?? detail.path
+      ?? detail.route
+      ?? detail.url
+      ?? detail.api
+      ?? detail.api_path
+      ?? detail.apiPath
+  );
+}
+
+function getUsageEventFallbackIdentity(event, breakdown = null, options = {}) {
+  const detail = (event && event.detail) || {};
+  const timestamp = stringifyIdentifier(detail.timestamp ?? detail.time ?? detail.created_at ?? detail.createdAt);
+  const normalizedTimestamp = normalizeIsoTimestamp(timestamp);
+  if (!normalizedTimestamp) return { detail };
+
+  const normalizedBreakdown = mergeTokenBreakdowns(createEmptyTokenBreakdown(), breakdown || normalizeCliProxyUsageDetailBreakdown(detail));
+  const detailModel = stringifyIdentifier(detail.model ?? detail.model_name ?? detail.modelName);
+  const contextModel = event && event.model ? String(event.model) : null;
+  const detailEndpoint = getUsageDetailEndpoint(detail);
+  const contextEndpoint = event && event.endpoint ? String(event.endpoint) : null;
+
+  return {
+    timestamp: normalizedTimestamp,
+    endpoint: options.includeContext ? (contextEndpoint || detailEndpoint || null) : (detailEndpoint || null),
+    model: options.includeContext ? (contextModel || detailModel || null) : (detailModel || null),
+    tokens: {
+      inputTokens: normalizedBreakdown.inputTokens,
+      outputTokens: normalizedBreakdown.outputTokens,
+      cachedTokens: normalizedBreakdown.cachedTokens,
+      reasoningTokens: normalizedBreakdown.reasoningTokens,
+      totalTokens: normalizedBreakdown.totalTokens
+    }
+  };
+}
+
 function buildUsageEventKey(event, breakdown = null) {
   const detail = (event && event.detail) || {};
   const explicitId = stringifyIdentifier(
@@ -2559,27 +2634,10 @@ function buildUsageEventKey(event, breakdown = null) {
     return `id:${normalizeIdentityValue(explicitId)}`;
   }
 
-  const timestamp = stringifyIdentifier(detail.timestamp ?? detail.time ?? detail.created_at ?? detail.createdAt);
-  const normalizedTimestamp = normalizeIsoTimestamp(timestamp);
-  const normalizedBreakdown = mergeTokenBreakdowns(createEmptyTokenBreakdown(), breakdown || normalizeCliProxyUsageDetailBreakdown(detail));
-  const fallbackIdentity = normalizedTimestamp
-    ? {
-        timestamp: normalizedTimestamp,
-        endpoint: event && event.endpoint ? String(event.endpoint) : null,
-        model: event && event.model ? String(event.model) : stringifyIdentifier(detail.model ?? detail.model_name ?? detail.modelName),
-        tokens: {
-          inputTokens: normalizedBreakdown.inputTokens,
-          outputTokens: normalizedBreakdown.outputTokens,
-          cachedTokens: normalizedBreakdown.cachedTokens,
-          reasoningTokens: normalizedBreakdown.reasoningTokens,
-          totalTokens: normalizedBreakdown.totalTokens
-        }
-      }
-    : { detail };
-  return `hash:${hashUsageEventIdentity(fallbackIdentity)}`;
+  return `hash:${hashUsageEventIdentity(getUsageEventFallbackIdentity(event, breakdown))}`;
 }
 
-function buildLegacyUsageEventKeys(event) {
+function buildLegacyUsageEventKeys(event, breakdown = null) {
   const detail = (event && event.detail) || {};
   const explicitId = stringifyIdentifier(
     detail.request_id
@@ -2598,7 +2656,10 @@ function buildLegacyUsageEventKeys(event) {
       identity: stringifyIdentifier(findFirstStringValue(detail, ['email', 'login', 'account', 'username', 'user']))
     })}`];
   }
-  return [`hash:${hashUsageEventIdentity({ detail })}`];
+  return Array.from(new Set([
+    `hash:${hashUsageEventIdentity({ detail })}`,
+    `hash:${hashUsageEventIdentity(getUsageEventFallbackIdentity(event, breakdown, { includeContext: true }))}`
+  ]));
 }
 
 function collectCliProxyUsageDetails(usageRoot) {
@@ -2761,6 +2822,26 @@ function appendAccountUsageToDailyStore(store, dayKey, statsKey, usage) {
   bucket.accounts[statsKey] = mergeTokenBreakdowns(bucket.accounts[statsKey] || createEmptyTokenBreakdown(), usage || {});
 }
 
+function subtractAccountUsageFromDailyStore(store, dayKey, statsKey, usage) {
+  if (!statsKey) return;
+  const bucket = store.daily && store.daily[dayKey];
+  if (!bucket || !bucket.accounts || !bucket.accounts[statsKey]) return;
+  const next = subtractTokenBreakdowns(bucket.accounts[statsKey], usage || {});
+  if (hasTokenBreakdownValue(next)) {
+    bucket.accounts[statsKey] = next;
+  } else {
+    delete bucket.accounts[statsKey];
+  }
+}
+
+function getTemporaryKeyForStatsKey(store, indexes, statsKey) {
+  if (!statsKey) return null;
+  const indexedRecord = indexes && indexes.byStatsKey ? indexes.byStatsKey.get(statsKey) : null;
+  if (indexedRecord && indexedRecord.temporaryKey) return indexedRecord.temporaryKey;
+  const meta = store.accountMeta && store.accountMeta[statsKey];
+  return meta && meta.temporaryKey ? meta.temporaryKey : null;
+}
+
 function applyCliProxyDetailedStore(store, detailedStore) {
   for (const [dayKey, dayEntry] of Object.entries(detailedStore.daily || {})) {
     appendDailyEntryFromCliProxyDetails(store, dayKey, dayEntry);
@@ -2813,7 +2894,7 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     let matchedEventKey = eventKey;
     let existingEvent = eventKey ? nextUsageEvents[eventKey] : null;
     if (!existingEvent) {
-      for (const legacyEventKey of buildLegacyUsageEventKeys(event)) {
+      for (const legacyEventKey of buildLegacyUsageEventKeys(event, breakdown)) {
         if (!legacyEventKey || legacyEventKey === eventKey || !nextUsageEvents[legacyEventKey]) continue;
         matchedEventKey = legacyEventKey;
         existingEvent = nextUsageEvents[legacyEventKey];
@@ -2823,11 +2904,17 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     if (existingEvent) {
       skippedEventCount += 1;
       let nextEventRecord = existingEvent;
-      if (accountRecord && accountRecord.statsKey && !existingEvent.statsKey) {
+      if (accountRecord && accountRecord.statsKey && existingEvent.statsKey !== accountRecord.statsKey) {
         const attributedDayKey = existingEvent.day || dayKey;
         const attributedBreakdown = hasTokenBreakdownTokens(existingEvent.breakdown)
           ? existingEvent.breakdown
           : breakdown;
+        if (existingEvent.statsKey) {
+          const previousTemporaryKey = getTemporaryKeyForStatsKey(store, indexes, existingEvent.statsKey);
+          subtractUsageFromTemporaryResetBaselineIfNeeded(store, previousTemporaryKey, event.detail, attributedDayKey, attributedBreakdown);
+          subtractAccountUsageFromDailyStore(store, attributedDayKey, existingEvent.statsKey, attributedBreakdown);
+          subtractAccountUsageFromDailyStore(rebuiltStore, attributedDayKey, existingEvent.statsKey, attributedBreakdown);
+        }
         addUsageToTemporaryResetBaselineIfNeeded(store, accountRecord.temporaryKey, event.detail, attributedDayKey, attributedBreakdown);
         appendAccountUsageToDailyStore(store, attributedDayKey, accountRecord.statsKey, attributedBreakdown);
         nextEventRecord = {
