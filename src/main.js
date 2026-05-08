@@ -63,6 +63,8 @@ let tokenStatsSyncInFlight = false;
 let tokenStatsSyncPending = false;
 let tokenStatsSyncActivePromise = null;
 let tokenStatsStoreQueue = Promise.resolve();
+let quitCleanupComplete = false;
+let quitCleanupPromise = null;
 
 // OAuth provider keys mapping (same as Swift version)
 const OAUTH_PROVIDER_KEYS = {
@@ -3839,7 +3841,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', (e) => e.preventDefault());
 
-app.on('before-quit', async () => {
+async function cleanupBeforeQuit() {
   if (tokenStatsSyncTimer) {
     clearTimeout(tokenStatsSyncTimer);
     tokenStatsSyncTimer = null;
@@ -3848,6 +3850,22 @@ app.on('before-quit', async () => {
   stopObservedInputMonitoring();
   stopKiroAutoSync();
   await stopServer();
+}
+
+app.on('before-quit', (event) => {
+  if (quitCleanupComplete) return;
+  event.preventDefault();
+
+  if (!quitCleanupPromise) {
+    quitCleanupPromise = cleanupBeforeQuit()
+      .catch((error) => {
+        console.warn('[App] Failed during quit cleanup:', error && error.message ? error.message : error);
+      })
+      .finally(() => {
+        quitCleanupComplete = true;
+        app.quit();
+      });
+  }
 });
 
 app.on('second-instance', () => {
