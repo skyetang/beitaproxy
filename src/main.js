@@ -1306,13 +1306,6 @@ function mergeAccountStatsKey(store, fromStatsKey, toStatsKey) {
     );
     delete dayEntry.accounts[fromStatsKey];
   }
-  if (store.accounts && store.accounts[fromStatsKey]) {
-    store.accounts[toStatsKey] = mergeTokenBreakdowns(
-      store.accounts[toStatsKey] || createEmptyTokenBreakdown(),
-      store.accounts[fromStatsKey]
-    );
-    delete store.accounts[fromStatsKey];
-  }
   for (const event of Object.values(store.usageEvents || {})) {
     if (event && event.statsKey === fromStatsKey) {
       event.statsKey = toStatsKey;
@@ -1524,6 +1517,13 @@ function createEmptyTokenStatsStore() {
     daily: {},
     usageEvents: {}
   };
+}
+
+function createResetTokenStatsStore(resetAt = new Date().toISOString()) {
+  const store = createEmptyTokenStatsStore();
+  store.updatedAt = resetAt;
+  store.usageResetAt = resetAt;
+  return store;
 }
 
 function createEmptyAccountMeta() {
@@ -2150,7 +2150,7 @@ function normalizeUsageBlock(usage) {
 
 function normalizeTokenStatsStorePayload(parsed) {
   if (!parsed || parsed.version !== TOKEN_STATS_STORE_VERSION) {
-    return createEmptyTokenStatsStore();
+    return createResetTokenStatsStore();
   }
 
   const store = createEmptyTokenStatsStore();
@@ -2176,6 +2176,7 @@ function readTokenStatsStore() {
     if (store) return store;
   } catch (e) {
     console.warn('[TokenStats] Failed to read primary token stats file:', e.message);
+    return createResetTokenStatsStore();
   }
 
   return createEmptyTokenStatsStore();
@@ -2636,11 +2637,6 @@ function collectCliProxyUsageDetails(usageRoot) {
   return events;
 }
 
-function addUsageToDailyGlobalStore(store, dayKey, usage) {
-  const bucket = ensureDailyBucket(store, dayKey);
-  bucket.global = mergeTokenBreakdowns(bucket.global || createEmptyTokenBreakdown(), usage);
-}
-
 function hasTokenBreakdownValue(value) {
   return !!(value && (
     value.totalTokens
@@ -2772,8 +2768,11 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     const accountRecord = resolveCliProxyUsageAccountRecord(event.detail, event.model, indexes);
     const existingEvent = eventKey ? nextUsageEvents[eventKey] : null;
     if (existingEvent) {
+      if (!accountRecord || !accountRecord.statsKey) {
+        continue;
+      }
       let nextEventRecord = existingEvent;
-      if (accountRecord && accountRecord.statsKey && existingEvent.statsKey !== accountRecord.statsKey) {
+      if (existingEvent.statsKey !== accountRecord.statsKey) {
         const attributedDayKey = existingEvent.day || dayKey;
         const attributedBreakdown = hasTokenBreakdownTokens(existingEvent.breakdown)
           ? existingEvent.breakdown
@@ -2824,8 +2823,6 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
           temporaryKey: accountRecord.temporaryKey
         });
       }
-    } else {
-      addUsageToDailyGlobalStore(rebuiltStore, dayKey, breakdown);
     }
   }
 
@@ -2954,9 +2951,7 @@ async function resetAllTokenStatistics() {
   try {
     return await queueTokenStatsStoreUpdate(async () => {
       const resetAt = new Date().toISOString();
-      const store = createEmptyTokenStatsStore();
-      store.updatedAt = resetAt;
-      store.usageResetAt = resetAt;
+      const store = createResetTokenStatsStore(resetAt);
       writeTokenStatsStore(store);
       return {
         success: true,
