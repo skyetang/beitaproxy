@@ -1004,7 +1004,7 @@ async function deleteAccount(filePath) {
     const entry = listAuthAccountEntries().find((item) => item.filePath === filePath);
     if (entry) {
       await queueTokenStatsStoreUpdate(async () => {
-        const store = readTokenStatsStore();
+        const store = readTokenStatsStore({ persistResetBoundary: true });
         const statsKey = buildAccountStatsKey(entry);
         const temporaryKey = buildTemporaryStatsKey(entry);
         const meta = ensureAccountMeta(store, entry, { statsKey, temporaryKey, deleted: true });
@@ -1035,7 +1035,7 @@ async function resetTemporaryTokenStats(temporaryKey) {
       return { success: false, error: 'Temporary token key is required' };
     }
     return await queueTokenStatsStoreUpdate(async () => {
-      const store = readTokenStatsStore();
+      const store = readTokenStatsStore({ persistResetBoundary: true });
       const syncInputs = await fetchCliProxyUsageSyncInputs().catch(() => null);
       if (syncInputs && syncInputs.success) {
         syncCliProxyUsageStatistics(store, syncInputs.payload, syncInputs.authFiles);
@@ -2177,8 +2177,8 @@ function readTokenStatsStoreFile(filePath) {
   return normalizeTokenStatsStorePayload(parsed);
 }
 
-function persistTokenStatsStoreIfNeeded(store) {
-  if (store && store[TOKEN_STATS_STORE_NEEDS_PERSIST]) {
+function persistTokenStatsStoreIfNeeded(store, shouldPersist = false) {
+  if (store && store[TOKEN_STATS_STORE_NEEDS_PERSIST] && shouldPersist) {
     delete store[TOKEN_STATS_STORE_NEEDS_PERSIST];
     try {
       writeTokenStatsStore(store);
@@ -2189,16 +2189,17 @@ function persistTokenStatsStoreIfNeeded(store) {
   return store;
 }
 
-function readTokenStatsStore() {
+function readTokenStatsStore(options = {}) {
+  const shouldPersist = options.persistResetBoundary === true;
   try {
     const store = readTokenStatsStoreFile(TOKEN_STATS_FILE);
-    if (store) return persistTokenStatsStoreIfNeeded(store);
+    if (store) return persistTokenStatsStoreIfNeeded(store, shouldPersist);
   } catch (e) {
     console.warn('[TokenStats] Failed to read primary token stats file:', e.message);
-    return persistTokenStatsStoreIfNeeded(createPersistedResetTokenStatsStore());
+    return persistTokenStatsStoreIfNeeded(createPersistedResetTokenStatsStore(), shouldPersist);
   }
 
-  return persistTokenStatsStoreIfNeeded(createPersistedResetTokenStatsStore());
+  return persistTokenStatsStoreIfNeeded(createPersistedResetTokenStatsStore(), shouldPersist);
 }
 
 function writeTokenStatsStore(store) {
@@ -2881,7 +2882,7 @@ async function runBackgroundTokenStatsSync() {
   tokenStatsSyncActivePromise = (async () => {
     try {
       await queueTokenStatsStoreUpdate(async () => {
-        const store = readTokenStatsStore();
+        const store = readTokenStatsStore({ persistResetBoundary: true });
         const inputs = await fetchCliProxyUsageSyncInputs();
         if (!inputs.success) {
           return;
@@ -2931,7 +2932,7 @@ async function refreshTokenStatistics() {
   try {
     return await queueTokenStatsStoreUpdate(async () => {
       const entries = listAuthAccountEntries();
-      const store = readTokenStatsStore();
+      const store = readTokenStatsStore({ persistResetBoundary: true });
       ensureTokenStatsAccountMetadata(store, entries);
       const cliProxyInputs = await fetchCliProxyUsageSyncInputs().catch((error) => ({
         success: false,
@@ -3639,7 +3640,7 @@ app.whenReady().then(async () => {
   loadLaunchAtLogin();
   ensureAuthDir();
   getConfigPath();
-  readTokenStatsStore();
+  readTokenStatsStore({ persistResetBoundary: true });
   startObservedInputMonitoring();
   await applyNetworkProxy();
   createTray();
