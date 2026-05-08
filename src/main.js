@@ -60,6 +60,7 @@ let activeManagementSecretKey = null;
 let tokenStatsSyncTimer = null;
 let tokenStatsSyncInFlight = false;
 let tokenStatsSyncPending = false;
+let tokenStatsStoreQueue = Promise.resolve();
 
 // OAuth provider keys mapping (same as Swift version)
 const OAUTH_PROVIDER_KEYS = {
@@ -1029,29 +1030,31 @@ async function resetTemporaryTokenStats(temporaryKey) {
     if (!temporaryKey) {
       return { success: false, error: 'Temporary token key is required' };
     }
-    const syncInputs = await fetchCliProxyUsageSyncInputs().catch(() => null);
-    const store = readTokenStatsStore();
-    if (syncInputs && syncInputs.success) {
-      syncCliProxyUsageStatistics(store, syncInputs.payload, syncInputs.authFiles);
-    }
-    const now = new Date();
-    const resetAt = now.toISOString();
-    const resetDay = getLocalDayKey(now);
-    const statsKey = findStatsKeyByTemporaryKey(store, temporaryKey);
-    const baseline = statsKey
-      ? getDailyAccountBreakdown(store, resetDay, statsKey)
-      : createEmptyTokenBreakdown();
+    return await queueTokenStatsStoreUpdate(async () => {
+      const syncInputs = await fetchCliProxyUsageSyncInputs().catch(() => null);
+      const store = readTokenStatsStore();
+      if (syncInputs && syncInputs.success) {
+        syncCliProxyUsageStatistics(store, syncInputs.payload, syncInputs.authFiles);
+      }
+      const now = new Date();
+      const resetAt = now.toISOString();
+      const resetDay = getLocalDayKey(now);
+      const statsKey = findStatsKeyByTemporaryKey(store, temporaryKey);
+      const baseline = statsKey
+        ? getDailyAccountBreakdown(store, resetDay, statsKey)
+        : createEmptyTokenBreakdown();
 
-    store.temporaryAccountResets = store.temporaryAccountResets || {};
-    store.temporaryAccounts[temporaryKey] = createEmptyTokenBreakdown();
-    store.temporaryAccountResets[temporaryKey] = {
-      resetAt,
-      resetDay,
-      baseline
-    };
-    store.updatedAt = new Date().toISOString();
-    writeTokenStatsStore(store);
-    return { success: true, stats: buildTokenStatisticsPayload(store) };
+      store.temporaryAccountResets = store.temporaryAccountResets || {};
+      store.temporaryAccounts[temporaryKey] = createEmptyTokenBreakdown();
+      store.temporaryAccountResets[temporaryKey] = {
+        resetAt,
+        resetDay,
+        baseline
+      };
+      store.updatedAt = new Date().toISOString();
+      writeTokenStatsStore(store);
+      return { success: true, stats: buildTokenStatisticsPayload(store) };
+    });
   } catch (e) {
     return { success: false, error: e.message };
   }
@@ -1389,42 +1392,6 @@ function sanitizeTokenCount(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric < 0) return 0;
   return Math.round(numeric);
-}
-
-function findFirstNumericValue(root, keys) {
-  const targets = new Set(keys.map(key => String(key || '').replace(/[^a-z0-9]/gi, '').toLowerCase()));
-  const visited = new Set();
-
-  function walk(value) {
-    if (!value || typeof value !== 'object') return null;
-    if (visited.has(value)) return null;
-    visited.add(value);
-
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        const found = walk(item);
-        if (found != null) return found;
-      }
-      return null;
-    }
-
-    for (const [key, nested] of Object.entries(value)) {
-      const normalizedKey = String(key || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
-      if (targets.has(normalizedKey)) {
-        const numeric = Number(nested);
-        if (Number.isFinite(numeric)) return numeric;
-      }
-    }
-
-    for (const nested of Object.values(value)) {
-      const found = walk(nested);
-      if (found != null) return found;
-    }
-
-    return null;
-  }
-
-  return walk(root);
 }
 
 function createEmptyTokenBreakdown() {
@@ -2110,65 +2077,10 @@ function writeTokenStatsStore(store) {
   try { fs.chmodSync(TOKEN_STATS_FILE, 0o600); } catch (e) {}
 }
 
-function extractClaudeUsageSnapshot(payload) {
-  const total = sanitizeTokenCount(findFirstNumericValue(payload, ['total_tokens', 'totalTokens', 'used_tokens', 'usedTokens', 'tokens_used']));
-  const input = sanitizeTokenCount(findFirstNumericValue(payload, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']));
-  const output = sanitizeTokenCount(findFirstNumericValue(payload, ['output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens']));
-  const separateCached = sumTokenCounts(
-    findFirstNumericValue(payload, ['cache_creation_input_tokens', 'cacheCreationInputTokens']),
-    findFirstNumericValue(payload, ['cache_read_input_tokens', 'cacheReadInputTokens'])
-  );
-  const cached = separateCached ?? sanitizeTokenCount(findFirstNumericValue(payload, [
-    'input_cached_tokens',
-    'inputCachedTokens',
-    'prompt_cached_tokens',
-    'promptCachedTokens',
-    'cached_tokens',
-    'cachedTokens'
-  ]));
-  const reasoning = sanitizeTokenCount(findFirstNumericValue(payload, ['reasoning_tokens', 'reasoningTokens', 'thinking_tokens', 'thinkingTokens']));
-  const normalizedTotal = total || input + output + cached + reasoning;
-  if (!normalizedTotal && !input && !output && !cached && !reasoning) return null;
-  return {
-    inputTokens: input,
-    outputTokens: output,
-    cachedTokens: cached,
-    reasoningTokens: reasoning,
-    totalTokens: normalizedTotal,
-    requestCount: 0
-  };
-}
-
-function extractCodexUsageSnapshot(payload) {
-  const total = sanitizeTokenCount(findFirstNumericValue(payload, ['total_tokens', 'totalTokens', 'used_tokens', 'usedTokens']));
-  if (!total) return null;
-  return {
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedTokens: 0,
-    reasoningTokens: 0,
-    totalTokens: total,
-    requestCount: 0
-  };
-}
-
-function extractKimiUsageSnapshot(payload) {
-  const usage = payload && typeof payload.usage === 'object' ? payload.usage : payload;
-  const used = sanitizeTokenCount(findFirstNumericValue(usage, ['used', 'used_tokens', 'usedTokens', 'total_tokens', 'totalTokens']));
-  const input = sanitizeTokenCount(findFirstNumericValue(usage, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']));
-  const output = sanitizeTokenCount(findFirstNumericValue(usage, ['output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens']));
-  const cached = sanitizeTokenCount(findFirstNumericValue(usage, ['cached_tokens', 'cachedTokens']));
-  const reasoning = sanitizeTokenCount(findFirstNumericValue(usage, ['reasoning_tokens', 'reasoningTokens']));
-  const total = used || input + output + cached + reasoning;
-  if (!total && !input && !output && !cached && !reasoning) return null;
-  return {
-    inputTokens: input,
-    outputTokens: output,
-    cachedTokens: cached,
-    reasoningTokens: reasoning,
-    totalTokens: total,
-    requestCount: 0
-  };
+function queueTokenStatsStoreUpdate(task) {
+  const run = tokenStatsStoreQueue.then(task, task);
+  tokenStatsStoreQueue = run.catch(() => {});
+  return run;
 }
 
 function fetchJsonWithElectronNet({ url, headers = {}, timeoutMs = 15000 }) {
@@ -2518,14 +2430,7 @@ function buildUsageEventKey(event) {
       ?? findFirstStringValue(detail, ['request_id', 'requestId', 'requestID', 'trace_id', 'traceId'])
   );
   if (explicitId) {
-    const explicitIdentity = {
-      id: explicitId,
-      provider: stringifyIdentifier(findFirstStringValue(detail, ['provider', 'provider_type', 'providerType', 'service', 'service_type', 'serviceType'])),
-      accountId: stringifyIdentifier(findFirstStringValue(detail, ['account_id', 'accountId', 'chatgpt_account_id', 'chatgptAccountId'])),
-      authIndex: getUsageDetailAuthIndex(detail),
-      identity: stringifyIdentifier(findFirstStringValue(detail, ['email', 'login', 'account', 'username', 'user']))
-    };
-    return `id:${crypto.createHash('sha256').update(JSON.stringify(stableJsonValue(explicitIdentity))).digest('hex')}`;
+    return `id:${normalizeIdentityValue(explicitId)}`;
   }
 
   const fallbackIdentity = {
@@ -2577,6 +2482,16 @@ function hasTokenBreakdownValue(value) {
       || value.cachedTokens
       || value.reasoningTokens
       || value.requestCount
+  ));
+}
+
+function hasTokenBreakdownTokens(value) {
+  return !!(value && (
+    value.totalTokens
+      || value.inputTokens
+      || value.outputTokens
+      || value.cachedTokens
+      || value.reasoningTokens
   ));
 }
 
@@ -2703,13 +2618,12 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
   const entries = listAuthAccountEntries();
   const rebuiltStore = createEmptyTokenStatsStore();
   rebuiltStore.accountMeta = normalizeAccountMetaMap(store.accountMeta || {});
-  rebuiltStore.providerSnapshots = store.providerSnapshots || {};
   const existingUsageEvents = normalizeUsageEventIndex(store.usageEvents || {});
   const nextUsageEvents = { ...existingUsageEvents };
   const indexes = buildCliProxyUsageAccountIndexes(rebuiltStore, entries, authFiles);
   const events = collectCliProxyUsageDetails(usageRoot);
   const hasExistingEventIndex = Object.keys(existingUsageEvents).length > 0;
-  const hasTokenEvents = events.some((event) => hasTokenBreakdownValue(normalizeCliProxyUsageDetailBreakdown(event.detail)));
+  const hasTokenEvents = events.some((event) => hasTokenBreakdownTokens(normalizeCliProxyUsageDetailBreakdown(event.detail)));
   const rebuildFromDetailedEvents = hasTokenEvents && !hasExistingEventIndex;
   const now = new Date().toISOString();
   let attributedCount = 0;
@@ -2722,13 +2636,12 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     store.accounts = {};
     store.daily = {};
     store.temporaryAccounts = {};
-    store.temporaryAccountResets = {};
     store.usageEvents = {};
   }
 
   for (const event of events) {
     const breakdown = normalizeCliProxyUsageDetailBreakdown(event.detail);
-    if (!hasTokenBreakdownValue(breakdown)) continue;
+    if (!hasTokenBreakdownTokens(breakdown)) continue;
 
     const dayKey = getCliProxyUsageDetailDayKey(event.detail);
     const eventKey = buildUsageEventKey(event);
@@ -2737,14 +2650,18 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     if (existingEvent) {
       skippedEventCount += 1;
       if (accountRecord && accountRecord.statsKey && !existingEvent.statsKey) {
-        appendAccountUsageToDailyStore(store, dayKey, accountRecord.statsKey, breakdown);
+        const attributedDayKey = existingEvent.day || dayKey;
+        const attributedBreakdown = hasTokenBreakdownTokens(existingEvent.breakdown)
+          ? existingEvent.breakdown
+          : breakdown;
+        appendAccountUsageToDailyStore(store, attributedDayKey, accountRecord.statsKey, attributedBreakdown);
         nextUsageEvents[eventKey] = {
           ...existingEvent,
-          day: existingEvent.day || dayKey,
+          day: attributedDayKey,
           statsKey: accountRecord.statsKey,
-          breakdown: mergeTokenBreakdowns(createEmptyTokenBreakdown(), breakdown),
-          totalTokens: sanitizeTokenCount(breakdown.totalTokens),
-          requestCount: sanitizeTokenCount(breakdown.requestCount),
+          breakdown: mergeTokenBreakdowns(createEmptyTokenBreakdown(), attributedBreakdown),
+          totalTokens: sanitizeTokenCount(attributedBreakdown.totalTokens),
+          requestCount: sanitizeTokenCount(attributedBreakdown.requestCount),
           seenAt: existingEvent.seenAt || now
         };
         attributedCount += 1;
@@ -2765,14 +2682,8 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     }
     newEventCount += 1;
 
-    rebuiltStore.global = mergeTokenBreakdowns(rebuiltStore.global || createEmptyTokenBreakdown(), breakdown);
-
     if (accountRecord && accountRecord.statsKey) {
       attributedCount += 1;
-      rebuiltStore.accounts[accountRecord.statsKey] = mergeTokenBreakdowns(
-        rebuiltStore.accounts[accountRecord.statsKey] || createEmptyTokenBreakdown(),
-        breakdown
-      );
       addUsageToDailyStore(rebuiltStore, dayKey, accountRecord.statsKey, breakdown);
       if (accountRecord.entry) {
         ensureAccountMeta(rebuiltStore, accountRecord.entry, {
@@ -2851,15 +2762,17 @@ async function runBackgroundTokenStatsSync() {
 
   tokenStatsSyncInFlight = true;
   try {
-    const inputs = await fetchCliProxyUsageSyncInputs();
-    if (!inputs.success) {
-      return;
-    }
-    const store = readTokenStatsStore();
-    const syncResult = syncCliProxyUsageStatistics(store, inputs.payload, inputs.authFiles);
-    if (syncResult.success) {
-      writeTokenStatsStore(store);
-    }
+    await queueTokenStatsStoreUpdate(async () => {
+      const inputs = await fetchCliProxyUsageSyncInputs();
+      if (!inputs.success) {
+        return;
+      }
+      const store = readTokenStatsStore();
+      const syncResult = syncCliProxyUsageStatistics(store, inputs.payload, inputs.authFiles);
+      if (syncResult.success) {
+        writeTokenStatsStore(store);
+      }
+    });
   } catch (e) {
   } finally {
     tokenStatsSyncInFlight = false;
@@ -2882,97 +2795,30 @@ function scheduleBackgroundTokenStatsSync() {
 
 async function refreshTokenStatistics() {
   try {
-    const entries = listAuthAccountEntries();
-    const cliProxyInputs = await fetchCliProxyUsageSyncInputs().catch((error) => ({
-      success: false,
-      error: error && error.message ? error.message : 'Usage sync failed'
-    }));
-    const usageRoot = cliProxyInputs.success ? getCliProxyUsageRoot(cliProxyInputs.payload) : null;
-    const hasDetailedUsage = usageRoot ? collectCliProxyUsageDetails(usageRoot).length > 0 : false;
-    const providerSnapshotUpdates = [];
+    return await queueTokenStatsStoreUpdate(async () => {
+      const entries = listAuthAccountEntries();
+      const cliProxyInputs = await fetchCliProxyUsageSyncInputs().catch((error) => ({
+        success: false,
+        error: error && error.message ? error.message : 'Usage sync failed'
+      }));
 
-    if (!hasDetailedUsage) {
+      const store = readTokenStatsStore();
       for (const entry of entries) {
         const statsKey = buildAccountStatsKey(entry);
+        const temporaryKey = buildTemporaryStatsKey(entry);
         if (!statsKey) continue;
-        const provider = entry.type;
-        const accessToken = entry.data.access_token || entry.data.token;
-        if (!accessToken) continue;
-
-        let result = null;
-        let snapshot = null;
-        let snapshotKey = null;
-
-        if (provider === 'claude') {
-          result = await fetchJsonWithElectronNet({
-            url: 'https://api.anthropic.com/api/oauth/usage',
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              'Content-Type': 'application/json',
-              'anthropic-beta': 'oauth-2025-04-20'
-            }
-          });
-          snapshot = result.success ? extractClaudeUsageSnapshot(result.payload) : null;
-          snapshotKey = `claude:${statsKey}`;
-        } else if (provider === 'codex') {
-          result = await fetchJsonWithElectronNet({
-            url: 'https://chatgpt.com/backend-api/wham/usage',
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              Accept: 'application/json',
-              'User-Agent': 'ToapiProxy',
-              ...(entry.data.account_id ? { 'ChatGPT-Account-Id': entry.data.account_id } : {})
-            }
-          });
-          snapshot = result.success ? extractCodexUsageSnapshot(result.payload) : null;
-          snapshotKey = `codex:${statsKey}`;
-        } else if (provider === 'kiro') {
-          result = await fetchJsonWithElectronNet({
-            url: 'https://api.kimi.com/coding/v1/usages',
-            headers: {
-              Authorization: `Bearer ${accessToken}`
-            }
-          });
-          snapshot = result.success ? extractKimiUsageSnapshot(result.payload) : null;
-          snapshotKey = `kiro:${statsKey}`;
-        }
-
-        if (!snapshotKey) continue;
-        if (snapshot) {
-          providerSnapshotUpdates.push({ snapshotKey, snapshot });
-        }
+        ensureAccountMeta(store, entry, { statsKey, temporaryKey });
       }
-    }
 
-    const store = readTokenStatsStore();
-    for (const entry of entries) {
-      const statsKey = buildAccountStatsKey(entry);
-      const temporaryKey = buildTemporaryStatsKey(entry);
-      if (!statsKey) continue;
-      ensureAccountMeta(store, entry, { statsKey, temporaryKey });
-    }
-
-    const cliProxySyncResult = cliProxyInputs.success
-      ? syncCliProxyUsageStatistics(store, cliProxyInputs.payload, cliProxyInputs.authFiles)
-      : cliProxyInputs;
-    if (cliProxySyncResult.success && cliProxySyncResult.detailed) {
+      if (cliProxyInputs.success) {
+        syncCliProxyUsageStatistics(store, cliProxyInputs.payload, cliProxyInputs.authFiles);
+      }
       writeTokenStatsStore(store);
       return {
         success: true,
         stats: buildTokenStatisticsPayload(store)
       };
-    }
-
-    for (const { snapshotKey, snapshot } of providerSnapshotUpdates) {
-      store.providerSnapshots[snapshotKey] = snapshot;
-      store.updatedAt = new Date().toISOString();
-    }
-
-    writeTokenStatsStore(store);
-    return {
-      success: true,
-      stats: buildTokenStatisticsPayload(store)
-    };
+    });
   } catch (e) {
     return { success: false, error: e.message };
   }
