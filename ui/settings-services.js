@@ -572,8 +572,8 @@ function createServicesController({
     showConfirm(
       t('remove.title'),
       t('remove.confirm', { email: account.email, serviceName }),
-      () => {
-        if (vp.deleteAccount(account.path)) {
+      async () => {
+        if (await vp.deleteAccount(account.path)) {
           showAlert(t('remove.removedTitle'), t('remove.removedMessage', { email: account.email }));
           delete usageStates[account.id];
           expandedUsage.delete(account.id);

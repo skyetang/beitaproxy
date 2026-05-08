@@ -890,9 +890,6 @@ function importKiroToken() {
 
 function getAuthAccounts() {
   const accounts = [];
-  const store = readTokenStatsStore();
-  let changed = false;
-
   for (const entry of listAuthAccountEntries()) {
     const data = entry.data;
 
@@ -906,11 +903,6 @@ function getAuthAccounts() {
 
     const statsKey = buildAccountStatsKey(entry);
     const temporaryKey = buildTemporaryStatsKey(entry);
-    const meta = ensureAccountMeta(store, entry, { statsKey, temporaryKey });
-    if (meta) changed = true;
-    if (ensureTemporaryAccountStats(store, temporaryKey)) {
-      changed = true;
-    }
 
     accounts.push({
       id: entry.id,
@@ -926,11 +918,17 @@ function getAuthAccounts() {
     });
   }
 
-  if (changed) {
-    writeTokenStatsStore(store);
-  }
-
   return accounts;
+}
+
+function ensureTokenStatsAccountMetadata(store, entries = listAuthAccountEntries()) {
+  for (const entry of entries) {
+    const statsKey = buildAccountStatsKey(entry);
+    const temporaryKey = buildTemporaryStatsKey(entry);
+    if (!statsKey) continue;
+    ensureAccountMeta(store, entry, { statsKey, temporaryKey });
+    ensureTemporaryAccountStats(store, temporaryKey);
+  }
 }
 
 function toggleAccountDisabled(accountId) {
@@ -996,25 +994,27 @@ function designateAccountForUse(accountId) {
   }
 }
 
-function deleteAccount(filePath) {
+async function deleteAccount(filePath) {
   try {
     const entry = listAuthAccountEntries().find((item) => item.filePath === filePath);
     if (entry) {
-      const store = readTokenStatsStore();
-      const statsKey = buildAccountStatsKey(entry);
-      const temporaryKey = buildTemporaryStatsKey(entry);
-      const meta = ensureAccountMeta(store, entry, { statsKey, temporaryKey, deleted: true });
-      if (meta) {
-        meta.deletedAt = new Date().toISOString();
-        store.accountMeta[statsKey] = meta;
-      }
-      if (temporaryKey) {
-        delete store.temporaryAccounts[temporaryKey];
-        if (store.temporaryAccountResets) {
-          delete store.temporaryAccountResets[temporaryKey];
+      await queueTokenStatsStoreUpdate(async () => {
+        const store = readTokenStatsStore();
+        const statsKey = buildAccountStatsKey(entry);
+        const temporaryKey = buildTemporaryStatsKey(entry);
+        const meta = ensureAccountMeta(store, entry, { statsKey, temporaryKey, deleted: true });
+        if (meta) {
+          meta.deletedAt = new Date().toISOString();
+          store.accountMeta[statsKey] = meta;
         }
-      }
-      writeTokenStatsStore(store);
+        if (temporaryKey) {
+          delete store.temporaryAccounts[temporaryKey];
+          if (store.temporaryAccountResets) {
+            delete store.temporaryAccountResets[temporaryKey];
+          }
+        }
+        writeTokenStatsStore(store);
+      });
     }
     fs.unlinkSync(filePath);
     getConfigPath();
@@ -1409,6 +1409,7 @@ function createEmptyTokenStatsStore() {
   return {
     version: 2,
     updatedAt: null,
+    usageResetAt: null,
     global: createEmptyTokenBreakdown(),
     accounts: {},
     temporaryAccounts: {},
@@ -1440,6 +1441,12 @@ function getLocalDayKey(date = new Date()) {
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+function normalizeIsoTimestamp(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
 function ensureDailyBucket(store, dayKey) {
@@ -1490,11 +1497,12 @@ function normalizeTemporaryAccountResetMap(value) {
       : (resetState && (resetState.resetAt || resetState.updatedAt || resetState.at));
     if (!resetAt) continue;
 
-    const resetDate = new Date(resetAt);
-    if (Number.isNaN(resetDate.getTime())) continue;
+    const normalizedResetAt = normalizeIsoTimestamp(resetAt);
+    if (!normalizedResetAt) continue;
+    const resetDate = new Date(normalizedResetAt);
 
     next[temporaryKey] = {
-      resetAt: resetDate.toISOString(),
+      resetAt: normalizedResetAt,
       resetDay: (resetState && resetState.resetDay) || getLocalDayKey(resetDate),
       baseline: mergeTokenBreakdowns(createEmptyTokenBreakdown(), (resetState && resetState.baseline) || {})
     };
@@ -1808,7 +1816,6 @@ function buildTokenStatisticsPayload(store) {
 
   for (const account of currentAccounts) {
     const storedTotals = getAccountTotalsFromSource(store, account.statsKey);
-    ensureTemporaryAccountStats(store, account.temporaryKey);
     const temporary = buildTemporaryAccountStats(store, account.statsKey, account.temporaryKey);
     temporaryAccounts[account.temporaryKey] = temporary;
     currentStatsById[account.id] = storedTotals;
@@ -2040,6 +2047,7 @@ function readTokenStatsStore() {
     const parsed = JSON.parse(fs.readFileSync(TOKEN_STATS_FILE, 'utf8'));
     const store = createEmptyTokenStatsStore();
     store.updatedAt = parsed.updatedAt || null;
+    store.usageResetAt = normalizeIsoTimestamp(parsed.usageResetAt || null);
     store.global = mergeTokenBreakdowns(createEmptyTokenBreakdown(), parsed.global || {});
     store.accounts = mergeBreakdownEntries(parsed.accounts || {});
     store.temporaryAccounts = mergeBreakdownEntries(parsed.temporaryAccounts || {});
@@ -2391,11 +2399,23 @@ function resolveCliProxyUsageAccountRecord(detail, model, indexes) {
   return providerEntries.length === 1 ? providerEntries[0] : null;
 }
 
-function getCliProxyUsageDetailDayKey(detail) {
+function getCliProxyUsageDetailDate(detail) {
   const timestamp = stringifyIdentifier(detail.timestamp ?? detail.time ?? detail.created_at ?? detail.createdAt);
-  if (!timestamp) return getLocalDayKey();
+  if (!timestamp) return null;
   const date = new Date(timestamp);
-  return Number.isNaN(date.getTime()) ? getLocalDayKey() : getLocalDayKey(date);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function getCliProxyUsageDetailDayKey(detail) {
+  const date = getCliProxyUsageDetailDate(detail);
+  return date ? getLocalDayKey(date) : getLocalDayKey();
+}
+
+function shouldIncludeUsageDetailAfterReset(store, detail) {
+  const resetAt = normalizeIsoTimestamp(store && store.usageResetAt);
+  if (!resetAt) return true;
+  const date = getCliProxyUsageDetailDate(detail);
+  return !!(date && date.getTime() > new Date(resetAt).getTime());
 }
 
 function normalizeCliProxyUsageDetailBreakdown(detail) {
@@ -2621,7 +2641,8 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
   const existingUsageEvents = normalizeUsageEventIndex(store.usageEvents || {});
   const nextUsageEvents = { ...existingUsageEvents };
   const indexes = buildCliProxyUsageAccountIndexes(rebuiltStore, entries, authFiles);
-  const events = collectCliProxyUsageDetails(usageRoot);
+  const sourceEvents = collectCliProxyUsageDetails(usageRoot);
+  const events = sourceEvents.filter((event) => shouldIncludeUsageDetailAfterReset(store, event.detail));
   const hasExistingEventIndex = Object.keys(existingUsageEvents).length > 0;
   const hasTokenEvents = events.some((event) => hasTokenBreakdownTokens(normalizeCliProxyUsageDetailBreakdown(event.detail)));
   const rebuildFromDetailedEvents = hasTokenEvents && !hasExistingEventIndex;
@@ -2706,6 +2727,7 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
         totalRequests: sanitizeTokenCount(usageRoot.total_requests ?? usageRoot.totalRequests),
         totalTokens: sanitizeTokenCount(usageRoot.total_tokens ?? usageRoot.totalTokens),
         detailCount: events.length,
+        sourceDetailCount: sourceEvents.length,
         newEventCount,
         skippedEventCount,
         reattributedCount,
@@ -2719,6 +2741,9 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
   }
 
   const aggregate = buildCliProxyAggregateStore(usageRoot);
+  if (aggregate.hasStats && normalizeIsoTimestamp(store.usageResetAt)) {
+    return { success: false, error: 'Aggregate usage cannot be safely applied after token statistics were reset' };
+  }
   if (aggregate.hasStats) {
     applyCliProxyAggregateStore(store, aggregate.store);
     store.providerSnapshots = {
@@ -2803,12 +2828,7 @@ async function refreshTokenStatistics() {
       }));
 
       const store = readTokenStatsStore();
-      for (const entry of entries) {
-        const statsKey = buildAccountStatsKey(entry);
-        const temporaryKey = buildTemporaryStatsKey(entry);
-        if (!statsKey) continue;
-        ensureAccountMeta(store, entry, { statsKey, temporaryKey });
-      }
+      ensureTokenStatsAccountMetadata(store, entries);
 
       if (cliProxyInputs.success) {
         syncCliProxyUsageStatistics(store, cliProxyInputs.payload, cliProxyInputs.authFiles);
@@ -2827,13 +2847,7 @@ async function refreshTokenStatistics() {
 function getTokenStatistics() {
   try {
     const store = readTokenStatsStore();
-    for (const entry of listAuthAccountEntries()) {
-      ensureAccountMeta(store, entry, {
-        statsKey: buildAccountStatsKey(entry),
-        temporaryKey: buildTemporaryStatsKey(entry)
-      });
-    }
-    writeTokenStatsStore(store);
+    ensureTokenStatsAccountMetadata(store);
     return {
       success: true,
       stats: buildTokenStatisticsPayload(store)
@@ -2843,14 +2857,19 @@ function getTokenStatistics() {
   }
 }
 
-function resetAllTokenStatistics() {
+async function resetAllTokenStatistics() {
   try {
-    const store = createEmptyTokenStatsStore();
-    writeTokenStatsStore(store);
-    return {
-      success: true,
-      stats: buildTokenStatisticsPayload(store)
-    };
+    return await queueTokenStatsStoreUpdate(async () => {
+      const resetAt = new Date().toISOString();
+      const store = createEmptyTokenStatsStore();
+      store.updatedAt = resetAt;
+      store.usageResetAt = resetAt;
+      writeTokenStatsStore(store);
+      return {
+        success: true,
+        stats: buildTokenStatisticsPayload(store)
+      };
+    });
   } catch (e) {
     return { success: false, error: e.message };
   }

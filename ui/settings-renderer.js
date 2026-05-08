@@ -452,8 +452,8 @@ function clearAllTokenStatistics() {
   showConfirm(
     t('tokenStats.clearAllConfirmTitle'),
     t('tokenStats.clearAllConfirmMessage'),
-    () => {
-      const result = vp.resetAllTokenStatistics ? vp.resetAllTokenStatistics() : { success: false, error: t('tokenStats.clearAllFailed') };
+    async () => {
+      const result = vp.resetAllTokenStatistics ? await vp.resetAllTokenStatistics() : { success: false, error: t('tokenStats.clearAllFailed') };
       if (!result || !result.success) {
         showAlert(t('common.error'), (result && result.error) || t('tokenStats.clearAllFailed'));
         return;
