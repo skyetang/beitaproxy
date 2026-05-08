@@ -926,6 +926,7 @@ function ensureTokenStatsAccountMetadata(store, entries = listAuthAccountEntries
     const statsKey = buildAccountStatsKey(entry);
     const temporaryKey = buildTemporaryStatsKey(entry);
     if (!statsKey) continue;
+    mergeAccountStatsAliases(store, entry, entries);
     ensureAccountMeta(store, entry, { statsKey, temporaryKey });
     ensureTemporaryAccountStats(store, temporaryKey);
   }
@@ -1250,11 +1251,103 @@ function buildAccountStatsKey(entry) {
   return [normalizedType, normalizedAccountId || normalizedEmail || entry.id].join('::');
 }
 
+function buildAccountStatsKeyCandidates(entry) {
+  if (!entry) return [];
+  const data = entry.data || {};
+  const normalizedType = String(entry.type || mapAuthTypeToService(data.type) || '').trim().toLowerCase();
+  if (!normalizedType) return [];
+  const values = [
+    data.account_id,
+    data.accountId,
+    data.chatgpt_account_id,
+    data.chatgptAccountId,
+    data.email,
+    data.login,
+    entry.id
+  ]
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter(Boolean);
+  return Array.from(new Set(values.map((value) => `${normalizedType}::${value}`)));
+}
+
 function buildTemporaryStatsKey(entry) {
   if (!entry) return null;
   const statsKey = buildAccountStatsKey(entry);
   if (!statsKey) return null;
   return `${entry.id}::${statsKey}`;
+}
+
+function mergeTemporaryStatsAlias(store, fromTemporaryKey, toTemporaryKey) {
+  if (!fromTemporaryKey || !toTemporaryKey || fromTemporaryKey === toTemporaryKey) return;
+  if (store.temporaryAccounts && store.temporaryAccounts[fromTemporaryKey]) {
+    store.temporaryAccounts[toTemporaryKey] = mergeTokenBreakdowns(
+      store.temporaryAccounts[toTemporaryKey] || createEmptyTokenBreakdown(),
+      store.temporaryAccounts[fromTemporaryKey]
+    );
+    delete store.temporaryAccounts[fromTemporaryKey];
+  }
+  const fromReset = store.temporaryAccountResets && store.temporaryAccountResets[fromTemporaryKey];
+  if (fromReset) {
+    if (!store.temporaryAccountResets[toTemporaryKey]) {
+      store.temporaryAccountResets[toTemporaryKey] = fromReset;
+    }
+    delete store.temporaryAccountResets[fromTemporaryKey];
+  }
+}
+
+function mergeAccountStatsKey(store, fromStatsKey, toStatsKey) {
+  if (!fromStatsKey || !toStatsKey || fromStatsKey === toStatsKey) return;
+  for (const dayEntry of Object.values(store.daily || {})) {
+    if (!dayEntry || !dayEntry.accounts || !dayEntry.accounts[fromStatsKey]) continue;
+    dayEntry.accounts[toStatsKey] = mergeTokenBreakdowns(
+      dayEntry.accounts[toStatsKey] || createEmptyTokenBreakdown(),
+      dayEntry.accounts[fromStatsKey]
+    );
+    delete dayEntry.accounts[fromStatsKey];
+  }
+  if (store.accounts && store.accounts[fromStatsKey]) {
+    store.accounts[toStatsKey] = mergeTokenBreakdowns(
+      store.accounts[toStatsKey] || createEmptyTokenBreakdown(),
+      store.accounts[fromStatsKey]
+    );
+    delete store.accounts[fromStatsKey];
+  }
+  for (const event of Object.values(store.usageEvents || {})) {
+    if (event && event.statsKey === fromStatsKey) {
+      event.statsKey = toStatsKey;
+    }
+  }
+  const fromMeta = store.accountMeta && store.accountMeta[fromStatsKey];
+  if (fromMeta) {
+    const toMeta = store.accountMeta[toStatsKey] || createEmptyAccountMeta();
+    store.accountMeta[toStatsKey] = {
+      ...fromMeta,
+      ...toMeta,
+      statsKey: toStatsKey,
+      temporaryKey: toMeta.temporaryKey || fromMeta.temporaryKey || null,
+      firstSeenAt: fromMeta.firstSeenAt || toMeta.firstSeenAt || null,
+      lastSeenAt: toMeta.lastSeenAt || fromMeta.lastSeenAt || null
+    };
+    delete store.accountMeta[fromStatsKey];
+  }
+}
+
+function mergeAccountStatsAliases(store, entry, entries = []) {
+  const canonicalStatsKey = buildAccountStatsKey(entry);
+  if (!store || !entry || !canonicalStatsKey) return;
+  const canonicalTemporaryKey = buildTemporaryStatsKey(entry);
+  const candidates = buildAccountStatsKeyCandidates(entry);
+  for (const candidate of candidates) {
+    if (!candidate || candidate === canonicalStatsKey) continue;
+    const sharedCandidate = entries.some((otherEntry) => (
+      otherEntry !== entry
+        && buildAccountStatsKey(otherEntry) !== canonicalStatsKey
+        && buildAccountStatsKeyCandidates(otherEntry).includes(candidate)
+    ));
+    if (sharedCandidate) continue;
+    mergeAccountStatsKey(store, candidate, canonicalStatsKey);
+    mergeTemporaryStatsAlias(store, `${entry.id}::${candidate}`, canonicalTemporaryKey);
+  }
 }
 
 function guessProviderFromModel(model) {
@@ -1522,6 +1615,15 @@ function getDailyAccountBreakdown(store, dayKey, statsKey) {
   return dayEntry && dayEntry.accounts && dayEntry.accounts[statsKey]
     ? mergeTokenBreakdowns(createEmptyTokenBreakdown(), dayEntry.accounts[statsKey])
     : createEmptyTokenBreakdown();
+}
+
+function addUsageToTemporaryResetBaselineIfNeeded(store, temporaryKey, detail, dayKey, usage) {
+  const resetState = getTemporaryAccountResetState(store, temporaryKey);
+  if (!resetState || resetState.resetDay !== dayKey) return;
+  const usageDate = getCliProxyUsageDetailDate(detail);
+  const resetAt = normalizeIsoTimestamp(resetState.resetAt);
+  if (!usageDate || !resetAt || usageDate.getTime() > new Date(resetAt).getTime()) return;
+  resetState.baseline = mergeTokenBreakdowns(resetState.baseline || createEmptyTokenBreakdown(), usage || {});
 }
 
 function sumAccountDailyTotals(store, statsKey, options = {}) {
@@ -2439,7 +2541,11 @@ function stableJsonValue(value) {
   return value;
 }
 
-function buildUsageEventKey(event) {
+function hashUsageEventIdentity(identity) {
+  return crypto.createHash('sha256').update(JSON.stringify(stableJsonValue(identity))).digest('hex');
+}
+
+function buildUsageEventKey(event, breakdown = null) {
   const detail = (event && event.detail) || {};
   const explicitId = stringifyIdentifier(
     detail.request_id
@@ -2453,10 +2559,46 @@ function buildUsageEventKey(event) {
     return `id:${normalizeIdentityValue(explicitId)}`;
   }
 
-  const fallbackIdentity = {
-    detail
-  };
-  return `hash:${crypto.createHash('sha256').update(JSON.stringify(stableJsonValue(fallbackIdentity))).digest('hex')}`;
+  const timestamp = stringifyIdentifier(detail.timestamp ?? detail.time ?? detail.created_at ?? detail.createdAt);
+  const normalizedTimestamp = normalizeIsoTimestamp(timestamp);
+  const normalizedBreakdown = mergeTokenBreakdowns(createEmptyTokenBreakdown(), breakdown || normalizeCliProxyUsageDetailBreakdown(detail));
+  const fallbackIdentity = normalizedTimestamp
+    ? {
+        timestamp: normalizedTimestamp,
+        endpoint: event && event.endpoint ? String(event.endpoint) : null,
+        model: event && event.model ? String(event.model) : stringifyIdentifier(detail.model ?? detail.model_name ?? detail.modelName),
+        tokens: {
+          inputTokens: normalizedBreakdown.inputTokens,
+          outputTokens: normalizedBreakdown.outputTokens,
+          cachedTokens: normalizedBreakdown.cachedTokens,
+          reasoningTokens: normalizedBreakdown.reasoningTokens,
+          totalTokens: normalizedBreakdown.totalTokens
+        }
+      }
+    : { detail };
+  return `hash:${hashUsageEventIdentity(fallbackIdentity)}`;
+}
+
+function buildLegacyUsageEventKeys(event) {
+  const detail = (event && event.detail) || {};
+  const explicitId = stringifyIdentifier(
+    detail.request_id
+      ?? detail.requestId
+      ?? detail.requestID
+      ?? detail.trace_id
+      ?? detail.traceId
+      ?? findFirstStringValue(detail, ['request_id', 'requestId', 'requestID', 'trace_id', 'traceId'])
+  );
+  if (explicitId) {
+    return [`id:${hashUsageEventIdentity({
+      id: explicitId,
+      provider: stringifyIdentifier(findFirstStringValue(detail, ['provider', 'provider_type', 'providerType', 'service', 'service_type', 'serviceType'])),
+      accountId: stringifyIdentifier(findFirstStringValue(detail, ['account_id', 'accountId', 'chatgpt_account_id', 'chatgptAccountId'])),
+      authIndex: getUsageDetailAuthIndex(detail),
+      identity: stringifyIdentifier(findFirstStringValue(detail, ['email', 'login', 'account', 'username', 'user']))
+    })}`];
+  }
+  return [`hash:${hashUsageEventIdentity({ detail })}`];
 }
 
 function collectCliProxyUsageDetails(usageRoot) {
@@ -2636,6 +2778,7 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
   }
 
   const entries = listAuthAccountEntries();
+  ensureTokenStatsAccountMetadata(store, entries);
   const rebuiltStore = createEmptyTokenStatsStore();
   rebuiltStore.accountMeta = normalizeAccountMetaMap(store.accountMeta || {});
   const existingUsageEvents = normalizeUsageEventIndex(store.usageEvents || {});
@@ -2665,18 +2808,29 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     if (!hasTokenBreakdownTokens(breakdown)) continue;
 
     const dayKey = getCliProxyUsageDetailDayKey(event.detail);
-    const eventKey = buildUsageEventKey(event);
+    const eventKey = buildUsageEventKey(event, breakdown);
     const accountRecord = resolveCliProxyUsageAccountRecord(event.detail, event.model, indexes);
-    const existingEvent = eventKey ? nextUsageEvents[eventKey] : null;
+    let matchedEventKey = eventKey;
+    let existingEvent = eventKey ? nextUsageEvents[eventKey] : null;
+    if (!existingEvent) {
+      for (const legacyEventKey of buildLegacyUsageEventKeys(event)) {
+        if (!legacyEventKey || legacyEventKey === eventKey || !nextUsageEvents[legacyEventKey]) continue;
+        matchedEventKey = legacyEventKey;
+        existingEvent = nextUsageEvents[legacyEventKey];
+        break;
+      }
+    }
     if (existingEvent) {
       skippedEventCount += 1;
+      let nextEventRecord = existingEvent;
       if (accountRecord && accountRecord.statsKey && !existingEvent.statsKey) {
         const attributedDayKey = existingEvent.day || dayKey;
         const attributedBreakdown = hasTokenBreakdownTokens(existingEvent.breakdown)
           ? existingEvent.breakdown
           : breakdown;
+        addUsageToTemporaryResetBaselineIfNeeded(store, accountRecord.temporaryKey, event.detail, attributedDayKey, attributedBreakdown);
         appendAccountUsageToDailyStore(store, attributedDayKey, accountRecord.statsKey, attributedBreakdown);
-        nextUsageEvents[eventKey] = {
+        nextEventRecord = {
           ...existingEvent,
           day: attributedDayKey,
           statsKey: accountRecord.statsKey,
@@ -2687,6 +2841,12 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
         };
         attributedCount += 1;
         reattributedCount += 1;
+      }
+      if (eventKey && matchedEventKey !== eventKey) {
+        nextUsageEvents[eventKey] = nextEventRecord;
+        delete nextUsageEvents[matchedEventKey];
+      } else if (eventKey) {
+        nextUsageEvents[eventKey] = nextEventRecord;
       }
       continue;
     }
@@ -2705,6 +2865,7 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
 
     if (accountRecord && accountRecord.statsKey) {
       attributedCount += 1;
+      addUsageToTemporaryResetBaselineIfNeeded(store, accountRecord.temporaryKey, event.detail, dayKey, breakdown);
       addUsageToDailyStore(rebuiltStore, dayKey, accountRecord.statsKey, breakdown);
       if (accountRecord.entry) {
         ensureAccountMeta(rebuiltStore, accountRecord.entry, {
