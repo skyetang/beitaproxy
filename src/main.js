@@ -932,7 +932,6 @@ function ensureTokenStatsAccountMetadata(store, entries = listAuthAccountEntries
     if (!statsKey) continue;
     mergeAccountStatsAliases(store, entry, entries);
     ensureAccountMeta(store, entry, { statsKey, temporaryKey });
-    ensureTemporaryAccountStats(store, temporaryKey);
   }
 }
 
@@ -1013,7 +1012,6 @@ async function deleteAccount(filePath) {
           store.accountMeta[statsKey] = meta;
         }
         if (temporaryKey) {
-          delete store.temporaryAccounts[temporaryKey];
           if (store.temporaryAccountResets) {
             delete store.temporaryAccountResets[temporaryKey];
           }
@@ -1050,7 +1048,6 @@ async function resetTemporaryTokenStats(temporaryKey) {
         : createEmptyTokenBreakdown();
 
       store.temporaryAccountResets = store.temporaryAccountResets || {};
-      store.temporaryAccounts[temporaryKey] = createEmptyTokenBreakdown();
       store.temporaryAccountResets[temporaryKey] = {
         resetAt,
         resetDay,
@@ -1283,13 +1280,6 @@ function buildTemporaryStatsKey(entry) {
 
 function mergeTemporaryStatsAlias(store, fromTemporaryKey, toTemporaryKey) {
   if (!fromTemporaryKey || !toTemporaryKey || fromTemporaryKey === toTemporaryKey) return;
-  if (store.temporaryAccounts && store.temporaryAccounts[fromTemporaryKey]) {
-    store.temporaryAccounts[toTemporaryKey] = mergeTokenBreakdowns(
-      store.temporaryAccounts[toTemporaryKey] || createEmptyTokenBreakdown(),
-      store.temporaryAccounts[fromTemporaryKey]
-    );
-    delete store.temporaryAccounts[fromTemporaryKey];
-  }
   const fromReset = store.temporaryAccountResets && store.temporaryAccountResets[fromTemporaryKey];
   if (fromReset) {
     const toReset = store.temporaryAccountResets[toTemporaryKey];
@@ -1529,7 +1519,6 @@ function createEmptyTokenStatsStore() {
     usageResetAt: null,
     global: createEmptyTokenBreakdown(),
     accounts: {},
-    temporaryAccounts: {},
     temporaryAccountResets: {},
     accountMeta: {},
     daily: {},
@@ -1596,13 +1585,6 @@ function ensureAccountMeta(store, entry, options = {}) {
   };
   store.accountMeta[statsKey] = next;
   return next;
-}
-
-function ensureTemporaryAccountStats(store, temporaryKey) {
-  if (!temporaryKey) return false;
-  if (store.temporaryAccounts[temporaryKey]) return false;
-  store.temporaryAccounts[temporaryKey] = createEmptyTokenBreakdown();
-  return true;
 }
 
 function normalizeTemporaryAccountResetMap(value) {
@@ -1700,8 +1682,7 @@ function buildTemporaryAccountStats(store, statsKey, temporaryKey) {
     const dailyTotals = sumAccountDailyTotals(store, statsKey, startDay ? { fromDay: startDay } : {});
     if (dailyTotals.hasSource) return dailyTotals.totals;
     const accountTotals = mergeTokenBreakdowns(createEmptyTokenBreakdown(), (store.accounts && store.accounts[statsKey]) || {});
-    if (hasTokenBreakdownStats(accountTotals)) return accountTotals;
-    return mergeTokenBreakdowns(createEmptyTokenBreakdown(), (store.temporaryAccounts && store.temporaryAccounts[temporaryKey]) || {});
+    return hasTokenBreakdownStats(accountTotals) ? accountTotals : createEmptyTokenBreakdown();
   }
 
   const dailyTotals = sumAccountDailyTotals(store, statsKey, { fromDay: resetState.resetDay });
@@ -1783,7 +1764,6 @@ function normalizeDailyEntry(entry) {
 }
 
 function reconcileTokenStatsStore(store) {
-  const storedGlobal = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.global || {});
   for (const dayEntry of Object.values(store.daily || {})) {
     const accountTotals = Object.values((dayEntry && dayEntry.accounts) || {})
       .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
@@ -1802,9 +1782,7 @@ function reconcileTokenStatsStore(store) {
   const accountTotals = Object.values(store.accounts || {})
     .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
   const dailyTotals = sumStoreDailyTotals(store, null);
-  store.global = hasTokenBreakdownValue(dailyTotals) || hasTokenBreakdownValue(accountTotals)
-    ? maxTokenBreakdowns(dailyTotals, accountTotals)
-    : storedGlobal;
+  store.global = maxTokenBreakdowns(dailyTotals, accountTotals);
   return store;
 }
 
@@ -2178,9 +2156,6 @@ function normalizeTokenStatsStorePayload(parsed) {
   const store = createEmptyTokenStatsStore();
   store.updatedAt = parsed.updatedAt || null;
   store.usageResetAt = normalizeIsoTimestamp(parsed.usageResetAt || null);
-  store.global = mergeTokenBreakdowns(createEmptyTokenBreakdown(), parsed.global || {});
-  store.accounts = mergeBreakdownEntries(parsed.accounts || {});
-  store.temporaryAccounts = mergeBreakdownEntries(parsed.temporaryAccounts || {});
   store.temporaryAccountResets = normalizeTemporaryAccountResetMap(parsed.temporaryAccountResets || {});
   store.accountMeta = normalizeAccountMetaMap(parsed.accountMeta || {});
   store.daily = normalizeDailyMap(parsed.daily || {});
@@ -2702,67 +2677,6 @@ function maxTokenBreakdowns(base, extra) {
   return next;
 }
 
-function normalizeCliProxyAggregateBreakdown(tokenValue, requestValue = null) {
-  let breakdown = createEmptyTokenBreakdown();
-  if (isPlainObjectValue(tokenValue)) {
-    breakdown = normalizeUsageBlock(tokenValue);
-  } else {
-    breakdown.totalTokens = sanitizeTokenCount(tokenValue);
-  }
-  breakdown.requestCount = sanitizeTokenCount(
-    requestValue
-      ?? (isPlainObjectValue(tokenValue) ? tokenValue.total_requests ?? tokenValue.totalRequests ?? tokenValue.request_count ?? tokenValue.requestCount : 0)
-  );
-  return breakdown;
-}
-
-function buildCliProxyAggregateStore(usageRoot) {
-  const aggregateStore = createEmptyTokenStatsStore();
-  let hasStats = false;
-
-  const rootBreakdown = normalizeCliProxyAggregateBreakdown(
-    {
-      input_tokens: usageRoot.input_tokens,
-      output_tokens: usageRoot.output_tokens,
-      cached_tokens: usageRoot.cached_tokens,
-      cache_tokens: usageRoot.cache_tokens,
-      reasoning_tokens: usageRoot.reasoning_tokens,
-      total_tokens: usageRoot.total_tokens
-    },
-    usageRoot.total_requests ?? usageRoot.totalRequests
-  );
-  if (hasTokenBreakdownValue(rootBreakdown)) {
-    aggregateStore.global = maxTokenBreakdowns(aggregateStore.global, rootBreakdown);
-    hasStats = true;
-  }
-
-  const tokensByDay = isPlainObjectValue(usageRoot.tokens_by_day)
-    ? usageRoot.tokens_by_day
-    : (isPlainObjectValue(usageRoot.tokensByDay) ? usageRoot.tokensByDay : {});
-  const requestsByDay = isPlainObjectValue(usageRoot.requests_by_day)
-    ? usageRoot.requests_by_day
-    : (isPlainObjectValue(usageRoot.requestsByDay) ? usageRoot.requestsByDay : {});
-  const dayKeys = new Set([...Object.keys(tokensByDay), ...Object.keys(requestsByDay)]);
-
-  for (const dayKey of dayKeys) {
-    const breakdown = normalizeCliProxyAggregateBreakdown(tokensByDay[dayKey], requestsByDay[dayKey]);
-    if (!hasTokenBreakdownValue(breakdown)) continue;
-    addUsageToDailyGlobalStore(aggregateStore, dayKey, breakdown);
-    aggregateStore.global = maxTokenBreakdowns(aggregateStore.global, breakdown);
-    hasStats = true;
-  }
-
-  return { store: aggregateStore, hasStats };
-}
-
-function applyCliProxyAggregateStore(store, aggregateStore) {
-  store.global = maxTokenBreakdowns(store.global || createEmptyTokenBreakdown(), aggregateStore.global || createEmptyTokenBreakdown());
-  for (const [dayKey, dayEntry] of Object.entries(aggregateStore.daily || {})) {
-    const target = ensureDailyBucket(store, dayKey);
-    target.global = maxTokenBreakdowns(target.global || createEmptyTokenBreakdown(), (dayEntry && dayEntry.global) || createEmptyTokenBreakdown());
-  }
-}
-
 function sumStoreDailyTotals(store, statsKey = null) {
   let totals = createEmptyTokenBreakdown();
   for (const dayEntry of Object.values(store.daily || {})) {
@@ -2846,7 +2760,6 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     store.global = createEmptyTokenBreakdown();
     store.accounts = {};
     store.daily = {};
-    store.temporaryAccounts = {};
     store.usageEvents = {};
   }
 
@@ -2924,18 +2837,7 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     return { success: true, detailed: true, detailCount: events.length, attributedCount };
   }
 
-  const aggregate = buildCliProxyAggregateStore(usageRoot);
-  if (aggregate.hasStats && normalizeIsoTimestamp(store.usageResetAt)) {
-    return { success: false, error: 'Aggregate usage cannot be safely applied after token statistics were reset' };
-  }
-  if (aggregate.hasStats) {
-    applyCliProxyAggregateStore(store, aggregate.store);
-    store.updatedAt = now;
-    reconcileTokenStatsStore(store);
-    return { success: true, detailed: false, aggregate: true };
-  }
-
-  return { success: false, error: 'Usage payload has no token statistics' };
+  return { success: false, error: 'Usage payload has no detailed token events' };
 }
 
 async function fetchCliProxyUsageSyncInputs() {
