@@ -591,7 +591,7 @@ function createServicesController({
 
   async function resetTemporaryStatsForAccount(accountId) {
     const account = getAccounts().find((item) => item.id === accountId);
-    const result = resetTemporaryTokenStats(accountId);
+    const result = await resetTemporaryTokenStats(accountId);
     if (!result || !result.success) {
       showAlert(t('common.error'), (result && result.error) || t('common.error'));
       return;
