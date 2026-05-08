@@ -35,7 +35,7 @@ const CODEX_LOCAL_AUTH_FILE = path.join(os.homedir(), '.codex', 'auth.json');
 const APP_VERSION = '1.0.1';
 const CONFIG_FILE = path.join(AUTH_DIR, 'beitaproxy-config.json');
 const TOKEN_STATS_FILE = path.join(app.getPath('userData'), 'token-stats.json');
-const TOKEN_STATS_BACKUP_FILE = `${TOKEN_STATS_FILE}.bak`;
+const TOKEN_STATS_STORE_VERSION = 3;
 const STARTUP_READINESS_TIMEOUT_MS = 15000;
 const STOP_TIMEOUT_MS = 4000;
 const OBSERVED_INPUTS_DEBOUNCE_MS = 400;
@@ -1524,7 +1524,7 @@ function createEmptyTokenBreakdown() {
 
 function createEmptyTokenStatsStore() {
   return {
-    version: 2,
+    version: TOKEN_STATS_STORE_VERSION,
     updatedAt: null,
     usageResetAt: null,
     global: createEmptyTokenBreakdown(),
@@ -1533,8 +1533,7 @@ function createEmptyTokenStatsStore() {
     temporaryAccountResets: {},
     accountMeta: {},
     daily: {},
-    usageEvents: {},
-    providerSnapshots: {}
+    usageEvents: {}
   };
 }
 
@@ -1784,25 +1783,19 @@ function normalizeDailyEntry(entry) {
 }
 
 function reconcileTokenStatsStore(store) {
-  const legacyGlobal = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.global || {});
+  const storedGlobal = mergeTokenBreakdowns(createEmptyTokenBreakdown(), store.global || {});
   for (const dayEntry of Object.values(store.daily || {})) {
     const accountTotals = Object.values((dayEntry && dayEntry.accounts) || {})
       .reduce((acc, totals) => mergeTokenBreakdowns(acc, totals || {}), createEmptyTokenBreakdown());
     dayEntry.global = maxTokenBreakdowns(dayEntry.global || createEmptyTokenBreakdown(), accountTotals);
   }
 
-  const legacyAccounts = mergeBreakdownEntries(store.accounts || {});
   const dailyStatsKeys = new Set(
     Object.values(store.daily || {}).flatMap((dayEntry) => Object.keys((dayEntry && dayEntry.accounts) || {}))
   );
   const nextAccounts = {};
   for (const statsKey of dailyStatsKeys) {
     nextAccounts[statsKey] = sumStoreDailyTotals(store, statsKey);
-  }
-  for (const [statsKey, totals] of Object.entries(legacyAccounts)) {
-    if (!nextAccounts[statsKey]) {
-      nextAccounts[statsKey] = totals;
-    }
   }
   store.accounts = nextAccounts;
 
@@ -1811,7 +1804,7 @@ function reconcileTokenStatsStore(store) {
   const dailyTotals = sumStoreDailyTotals(store, null);
   store.global = hasTokenBreakdownValue(dailyTotals) || hasTokenBreakdownValue(accountTotals)
     ? maxTokenBreakdowns(dailyTotals, accountTotals)
-    : legacyGlobal;
+    : storedGlobal;
   return store;
 }
 
@@ -2178,6 +2171,10 @@ function normalizeUsageBlock(usage) {
 }
 
 function normalizeTokenStatsStorePayload(parsed) {
+  if (!parsed || parsed.version !== TOKEN_STATS_STORE_VERSION) {
+    return createEmptyTokenStatsStore();
+  }
+
   const store = createEmptyTokenStatsStore();
   store.updatedAt = parsed.updatedAt || null;
   store.usageResetAt = normalizeIsoTimestamp(parsed.usageResetAt || null);
@@ -2188,23 +2185,6 @@ function normalizeTokenStatsStorePayload(parsed) {
   store.accountMeta = normalizeAccountMetaMap(parsed.accountMeta || {});
   store.daily = normalizeDailyMap(parsed.daily || {});
   store.usageEvents = normalizeUsageEventIndex(parsed.usageEvents || {});
-  store.providerSnapshots = parsed.providerSnapshots && typeof parsed.providerSnapshots === 'object' ? parsed.providerSnapshots : {};
-
-  if (parsed.version === 1) {
-    for (const statsKey of Object.keys(store.accounts)) {
-      if (!store.accountMeta[statsKey]) {
-        const parts = statsKey.split('::');
-        store.accountMeta[statsKey] = {
-          ...createEmptyAccountMeta(),
-          statsKey,
-          provider: parts[0] || null,
-          email: parts.slice(1).join('::') || statsKey,
-          firstSeenAt: store.updatedAt,
-          lastSeenAt: store.updatedAt
-        };
-      }
-    }
-  }
 
   return reconcileTokenStatsStore(store);
 }
@@ -2223,13 +2203,6 @@ function readTokenStatsStore() {
     console.warn('[TokenStats] Failed to read primary token stats file:', e.message);
   }
 
-  try {
-    const backupStore = readTokenStatsStoreFile(TOKEN_STATS_BACKUP_FILE);
-    if (backupStore) return backupStore;
-  } catch (e) {
-    console.warn('[TokenStats] Failed to read backup token stats file:', e.message);
-  }
-
   return createEmptyTokenStatsStore();
 }
 
@@ -2240,12 +2213,6 @@ function writeTokenStatsStore(store) {
     fs.writeFileSync(tempFile, JSON.stringify(store, null, 2), 'utf8');
     try { fs.chmodSync(tempFile, 0o600); } catch (e) {}
     fs.renameSync(tempFile, TOKEN_STATS_FILE);
-    try {
-      fs.copyFileSync(TOKEN_STATS_FILE, TOKEN_STATS_BACKUP_FILE);
-      try { fs.chmodSync(TOKEN_STATS_BACKUP_FILE, 0o600); } catch (e) {}
-    } catch (backupError) {
-      console.warn('[TokenStats] Failed to update token stats backup:', backupError.message);
-    }
   } catch (e) {
     try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch (cleanupError) {}
     throw e;
@@ -2623,7 +2590,7 @@ function getUsageDetailEndpoint(detail) {
   );
 }
 
-function getUsageEventFallbackIdentity(event, breakdown = null, options = {}) {
+function getUsageEventFallbackIdentity(event, breakdown = null) {
   const detail = (event && event.detail) || {};
   const timestamp = stringifyIdentifier(detail.timestamp ?? detail.time ?? detail.created_at ?? detail.createdAt);
   const normalizedTimestamp = normalizeIsoTimestamp(timestamp);
@@ -2631,14 +2598,12 @@ function getUsageEventFallbackIdentity(event, breakdown = null, options = {}) {
 
   const normalizedBreakdown = mergeTokenBreakdowns(createEmptyTokenBreakdown(), breakdown || normalizeCliProxyUsageDetailBreakdown(detail));
   const detailModel = stringifyIdentifier(detail.model ?? detail.model_name ?? detail.modelName);
-  const contextModel = event && event.model ? String(event.model) : null;
   const detailEndpoint = getUsageDetailEndpoint(detail);
-  const contextEndpoint = event && event.endpoint ? String(event.endpoint) : null;
 
   return {
     timestamp: normalizedTimestamp,
-    endpoint: options.includeContext ? (contextEndpoint || detailEndpoint || null) : (detailEndpoint || null),
-    model: options.includeContext ? (contextModel || detailModel || null) : (detailModel || null),
+    endpoint: detailEndpoint || null,
+    model: detailModel || null,
     tokens: {
       inputTokens: normalizedBreakdown.inputTokens,
       outputTokens: normalizedBreakdown.outputTokens,
@@ -2664,31 +2629,6 @@ function buildUsageEventKey(event, breakdown = null) {
   }
 
   return `hash:${hashUsageEventIdentity(getUsageEventFallbackIdentity(event, breakdown))}`;
-}
-
-function buildLegacyUsageEventKeys(event, breakdown = null) {
-  const detail = (event && event.detail) || {};
-  const explicitId = stringifyIdentifier(
-    detail.request_id
-      ?? detail.requestId
-      ?? detail.requestID
-      ?? detail.trace_id
-      ?? detail.traceId
-      ?? findFirstStringValue(detail, ['request_id', 'requestId', 'requestID', 'trace_id', 'traceId'])
-  );
-  if (explicitId) {
-    return [`id:${hashUsageEventIdentity({
-      id: explicitId,
-      provider: stringifyIdentifier(findFirstStringValue(detail, ['provider', 'provider_type', 'providerType', 'service', 'service_type', 'serviceType'])),
-      accountId: stringifyIdentifier(findFirstStringValue(detail, ['account_id', 'accountId', 'chatgpt_account_id', 'chatgptAccountId'])),
-      authIndex: getUsageDetailAuthIndex(detail),
-      identity: stringifyIdentifier(findFirstStringValue(detail, ['email', 'login', 'account', 'username', 'user']))
-    })}`];
-  }
-  return Array.from(new Set([
-    `hash:${hashUsageEventIdentity({ detail })}`,
-    `hash:${hashUsageEventIdentity(getUsageEventFallbackIdentity(event, breakdown, { includeContext: true }))}`
-  ]));
 }
 
 function collectCliProxyUsageDetails(usageRoot) {
@@ -2901,9 +2841,6 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
   const rebuildFromDetailedEvents = hasTokenEvents && !hasExistingEventIndex;
   const now = new Date().toISOString();
   let attributedCount = 0;
-  let newEventCount = 0;
-  let skippedEventCount = 0;
-  let reattributedCount = 0;
 
   if (rebuildFromDetailedEvents) {
     store.global = createEmptyTokenBreakdown();
@@ -2920,18 +2857,8 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     const dayKey = getCliProxyUsageDetailDayKey(event.detail);
     const eventKey = buildUsageEventKey(event, breakdown);
     const accountRecord = resolveCliProxyUsageAccountRecord(event.detail, event.model, indexes);
-    let matchedEventKey = eventKey;
-    let existingEvent = eventKey ? nextUsageEvents[eventKey] : null;
-    if (!existingEvent) {
-      for (const legacyEventKey of buildLegacyUsageEventKeys(event, breakdown)) {
-        if (!legacyEventKey || legacyEventKey === eventKey || !nextUsageEvents[legacyEventKey]) continue;
-        matchedEventKey = legacyEventKey;
-        existingEvent = nextUsageEvents[legacyEventKey];
-        break;
-      }
-    }
+    const existingEvent = eventKey ? nextUsageEvents[eventKey] : null;
     if (existingEvent) {
-      skippedEventCount += 1;
       let nextEventRecord = existingEvent;
       if (accountRecord && accountRecord.statsKey && existingEvent.statsKey !== accountRecord.statsKey) {
         const attributedDayKey = existingEvent.day || dayKey;
@@ -2956,12 +2883,8 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
           seenAt: existingEvent.seenAt || now
         };
         attributedCount += 1;
-        reattributedCount += 1;
       }
-      if (eventKey && matchedEventKey !== eventKey) {
-        nextUsageEvents[eventKey] = nextEventRecord;
-        delete nextUsageEvents[matchedEventKey];
-      } else if (eventKey) {
+      if (eventKey) {
         nextUsageEvents[eventKey] = nextEventRecord;
       }
       continue;
@@ -2977,7 +2900,6 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
         seenAt: now
       };
     }
-    newEventCount += 1;
 
     if (accountRecord && accountRecord.statsKey) {
       attributedCount += 1;
@@ -2997,21 +2919,6 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
   if (hasTokenEvents) {
     applyCliProxyDetailedStore(store, rebuiltStore);
     store.usageEvents = nextUsageEvents;
-    store.providerSnapshots = {
-      ...(store.providerSnapshots || {}),
-      'cli-proxy-api:usage': {
-        updatedAt: now,
-        totalRequests: sanitizeTokenCount(usageRoot.total_requests ?? usageRoot.totalRequests),
-        totalTokens: sanitizeTokenCount(usageRoot.total_tokens ?? usageRoot.totalTokens),
-        detailCount: events.length,
-        sourceDetailCount: sourceEvents.length,
-        newEventCount,
-        skippedEventCount,
-        reattributedCount,
-        attributedCount,
-        eventIndexBootstrapped: rebuildFromDetailedEvents
-      }
-    };
     store.updatedAt = now;
     reconcileTokenStatsStore(store);
     return { success: true, detailed: true, detailCount: events.length, attributedCount };
@@ -3023,16 +2930,6 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
   }
   if (aggregate.hasStats) {
     applyCliProxyAggregateStore(store, aggregate.store);
-    store.providerSnapshots = {
-      ...(store.providerSnapshots || {}),
-      'cli-proxy-api:usage': {
-        updatedAt: now,
-        totalRequests: sanitizeTokenCount(usageRoot.total_requests ?? usageRoot.totalRequests),
-        totalTokens: sanitizeTokenCount(usageRoot.total_tokens ?? usageRoot.totalTokens),
-        detailCount: 0,
-        attributedCount: 0
-      }
-    };
     store.updatedAt = now;
     reconcileTokenStatsStore(store);
     return { success: true, detailed: false, aggregate: true };
