@@ -2039,89 +2039,6 @@ function normalizeUsageBlock(usage) {
   };
 }
 
-function extractUsageFromPayload(payload) {
-  if (!payload || typeof payload !== 'object') return null;
-  if (payload.usage && typeof payload.usage === 'object') return payload.usage;
-  if (payload.message && typeof payload.message.usage === 'object') return payload.message.usage;
-  if (payload.delta && typeof payload.delta.usage === 'object') return payload.delta.usage;
-  if (payload.response && typeof payload.response.usage === 'object') return payload.response.usage;
-  if (payload.completion && typeof payload.completion.usage === 'object') return payload.completion.usage;
-  if (payload.result && typeof payload.result.usage === 'object') return payload.result.usage;
-  if (Array.isArray(payload.output)) {
-    for (let index = payload.output.length - 1; index >= 0; index -= 1) {
-      const usage = extractUsageFromPayload(payload.output[index]);
-      if (usage) return usage;
-    }
-  }
-  return null;
-}
-
-function extractUsageFromSseBuffer(bufferText) {
-  if (!bufferText) return null;
-
-  const events = bufferText.split(/\r?\n\r?\n/);
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const rawEvent = events[index];
-    if (!rawEvent || !rawEvent.includes('data:')) continue;
-
-    const dataLines = rawEvent
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trim())
-      .filter(Boolean);
-
-    if (!dataLines.length) continue;
-
-    const dataText = dataLines.join('\n');
-    if (dataText === '[DONE]') continue;
-
-    try {
-      const payload = JSON.parse(dataText);
-      const usage = extractUsageFromPayload(payload);
-      if (usage) return usage;
-    } catch (e) {}
-  }
-
-  return null;
-}
-
-function extractUsageFromJsonLines(bufferText) {
-  if (!bufferText) return null;
-
-  const lines = bufferText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index];
-    if (line === '[DONE]') continue;
-    const jsonText = line.startsWith('data:') ? line.slice(5).trim() : line;
-    if (!jsonText || jsonText === '[DONE]') continue;
-
-    try {
-      const payload = JSON.parse(jsonText);
-      const usage = extractUsageFromPayload(payload);
-      if (usage) return usage;
-    } catch (e) {}
-  }
-
-  return null;
-}
-
-function extractUsageFromResponse(responseText, contentType) {
-  if (!responseText) return null;
-
-  if (contentType.includes('application/json')) {
-    try {
-      return extractUsageFromPayload(JSON.parse(responseText));
-    } catch (e) {}
-  }
-
-  if (contentType.includes('text/event-stream') || responseText.includes('\ndata:') || responseText.startsWith('data:')) {
-    const usage = extractUsageFromSseBuffer(responseText);
-    if (usage) return usage;
-  }
-
-  return extractUsageFromJsonLines(responseText);
-}
-
 function readTokenStatsStore() {
   try {
     if (!fs.existsSync(TOKEN_STATS_FILE)) {
@@ -2164,32 +2081,6 @@ function writeTokenStatsStore(store) {
   ensureParentDir(TOKEN_STATS_FILE);
   fs.writeFileSync(TOKEN_STATS_FILE, JSON.stringify(store, null, 2), 'utf8');
   try { fs.chmodSync(TOKEN_STATS_FILE, 0o600); } catch (e) {}
-}
-
-function recordTokenUsage(statsKey, usage, options = {}) {
-  if (!statsKey) return;
-  const normalizedUsage = normalizeUsageBlock(usage);
-  if (!normalizedUsage.totalTokens && !normalizedUsage.inputTokens && !normalizedUsage.outputTokens && !normalizedUsage.cachedTokens && !normalizedUsage.reasoningTokens) {
-    return;
-  }
-
-  const store = readTokenStatsStore();
-  const now = new Date();
-  const dayKey = getLocalDayKey(now);
-  const updatedAt = now.toISOString();
-  if (options.temporaryKey) {
-    ensureTemporaryAccountStats(store, options.temporaryKey);
-  }
-  addUsageToDailyStore(store, dayKey, statsKey, normalizedUsage);
-  if (options.entry) {
-    ensureAccountMeta(store, options.entry, {
-      statsKey,
-      temporaryKey: options.temporaryKey
-    });
-  }
-  store.updatedAt = updatedAt;
-  reconcileTokenStatsStore(store);
-  writeTokenStatsStore(store);
 }
 
 function extractClaudeUsageSnapshot(payload) {
@@ -3158,11 +3049,6 @@ function startThinkingProxy() {
           headers: { ...req.headers }
         };
 
-        const resolvedAccountEntry = req.method === 'POST' ? resolveAccountEntryForRequest(modifiedBody, req.headers) : null;
-        const resolvedStatsKey = resolvedAccountEntry ? buildAccountStatsKey(resolvedAccountEntry) : null;
-        const resolvedTemporaryKey = resolvedAccountEntry ? buildTemporaryStatsKey(resolvedAccountEntry) : null;
-        const responseChunks = [];
-
         options.headers['content-length'] = Buffer.byteLength(modifiedBody);
         options.headers.host = `127.0.0.1:${BACKEND_PORT}`;
 
@@ -3181,20 +3067,11 @@ function startThinkingProxy() {
           res.writeHead(proxyRes.statusCode, proxyRes.headers);
 
           proxyRes.on('data', (chunk) => {
-            responseChunks.push(Buffer.from(chunk));
             res.write(chunk);
           });
 
           proxyRes.on('end', () => {
             res.end();
-            const contentType = String(proxyRes.headers['content-type'] || '').toLowerCase();
-            const responseText = Buffer.concat(responseChunks).toString('utf8');
-            if (resolvedStatsKey) {
-              recordTokenUsage(resolvedStatsKey, extractUsageFromResponse(responseText, contentType), {
-                entry: resolvedAccountEntry,
-                temporaryKey: resolvedTemporaryKey
-              });
-            }
             scheduleBackgroundTokenStatsSync();
           });
         });
