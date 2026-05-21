@@ -48,8 +48,14 @@ const { renderUsageState, renderTokenStatsPage, renderTemporaryTokenState } = cr
   temporaryTokenStates
 });
 
+function getAccountById(accountId) {
+  return vp.getAuthAccounts ? vp.getAuthAccounts().find((item) => item.id === accountId) : null;
+}
+
 function getAccountDetailTab(accountId) {
-  return accountDetailTabs[accountId] || 'usage';
+  const account = getAccountById(accountId);
+  if (account && account.type !== 'codex') return 'tokens';
+  return accountDetailTabs[accountId] === 'tokens' ? 'tokens' : 'usage';
 }
 
 function queryDefaultUsageForVisibleAccounts() {
@@ -79,7 +85,7 @@ async function refreshTemporaryTokenState(accountId) {
   renderServices();
   await new Promise((resolve) => setTimeout(resolve, 0));
   try {
-    const result = await vp.getTokenStatistics();
+    const result = await (vp.refreshTokenStatistics ? vp.refreshTokenStatistics() : vp.getTokenStatistics());
     if (result && result.success && result.stats) {
       tokenStatsState = { loading: false, error: null, stats: result.stats };
     }
@@ -110,10 +116,11 @@ function createEmptyTokenStats() {
 
 function setAccountDetailTab(accountId, tab) {
   if (tab !== 'usage' && tab !== 'tokens') return;
-  accountDetailTabs[accountId] = tab;
+  const account = getAccountById(accountId);
+  const nextTab = account && account.type !== 'codex' ? 'tokens' : tab;
+  accountDetailTabs[accountId] = nextTab;
   renderServices();
-  if (tab === 'usage') {
-    const account = vp.getAuthAccounts ? vp.getAuthAccounts().find((item) => item.id === accountId) : null;
+  if (nextTab === 'usage') {
     if (account && account.type === 'codex') {
       queryCodexUsage(accountId);
     }
@@ -142,12 +149,21 @@ function toggleTokenAccountExpand(statsKey) {
 
 function toggleAccountDetails(accountId) {
   if (!accountId) return;
+  const wasExpanded = expandedUsage.has(accountId);
+  const account = getAccountById(accountId);
   if (expandedUsage.has(accountId)) {
     expandedUsage.delete(accountId);
   } else {
     expandedUsage.add(accountId);
+    if (account && account.type !== 'codex') {
+      accountDetailTabs[accountId] = 'tokens';
+    }
   }
   renderServices();
+  if (!wasExpanded && getAccountDetailTab(accountId) === 'tokens') {
+    refreshTemporaryTokenState(accountId);
+    return;
+  }
   queryDefaultUsageForVisibleAccounts();
 }
 

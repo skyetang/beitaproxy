@@ -37,6 +37,8 @@ const CONFIG_FILE = path.join(AUTH_DIR, 'beitaproxy-config.json');
 const TOKEN_STATS_FILE = path.join(app.getPath('userData'), 'token-stats.json');
 const TOKEN_STATS_STORE_VERSION = 3;
 const TOKEN_STATS_STORE_NEEDS_PERSIST = Symbol('tokenStatsStoreNeedsPersist');
+const UNATTRIBUTED_ACCOUNT_ID = '__unattributed__';
+const TOKEN_STATS_RETENTION_DAYS = 120;
 const STARTUP_READINESS_TIMEOUT_MS = 15000;
 const STOP_TIMEOUT_MS = 4000;
 const OBSERVED_INPUTS_DEBOUNCE_MS = 400;
@@ -1279,6 +1281,15 @@ function buildTemporaryStatsKey(entry) {
   return `${entry.id}::${statsKey}`;
 }
 
+function buildUnattributedStatsKey(provider) {
+  const normalizedProvider = mapAuthTypeToService(provider) || 'unknown';
+  return `${normalizedProvider}::${UNATTRIBUTED_ACCOUNT_ID}`;
+}
+
+function isUnattributedStatsKey(statsKey) {
+  return String(statsKey || '').endsWith(`::${UNATTRIBUTED_ACCOUNT_ID}`);
+}
+
 function mergeTemporaryStatsAlias(store, fromTemporaryKey, toTemporaryKey) {
   if (!fromTemporaryKey || !toTemporaryKey || fromTemporaryKey === toTemporaryKey) return;
   const fromReset = store.temporaryAccountResets && store.temporaryAccountResets[fromTemporaryKey];
@@ -1509,6 +1520,7 @@ function createEmptyTokenBreakdown() {
 function createEmptyTokenStatsStore() {
   return {
     version: TOKEN_STATS_STORE_VERSION,
+    retentionDays: TOKEN_STATS_RETENTION_DAYS,
     updatedAt: null,
     usageResetAt: null,
     global: createEmptyTokenBreakdown(),
@@ -1544,7 +1556,8 @@ function createEmptyAccountMeta() {
     firstSeenAt: null,
     lastSeenAt: null,
     lastKnownAccountId: null,
-    deletedAt: null
+    deletedAt: null,
+    unattributed: false
   };
 }
 
@@ -1759,6 +1772,91 @@ function normalizeUsageEventIndex(value) {
   return next;
 }
 
+function getTokenStatsRetentionCutoffDayKey(referenceDate = new Date()) {
+  const retentionDays = Math.max(1, TOKEN_STATS_RETENTION_DAYS);
+  const cutoff = new Date(referenceDate);
+  cutoff.setHours(0, 0, 0, 0);
+  cutoff.setDate(cutoff.getDate() - retentionDays + 1);
+  return getLocalDayKey(cutoff);
+}
+
+function getUsageEventDayKey(event) {
+  if (event && event.day) return String(event.day);
+  const seenAt = normalizeIsoTimestamp(event && event.seenAt);
+  if (!seenAt) return null;
+  return getLocalDayKey(new Date(seenAt));
+}
+
+function shouldIncludeUsageDetailAfterRetention(detail, cutoffDay = getTokenStatsRetentionCutoffDayKey()) {
+  const dayKey = getCliProxyUsageDetailDayKey(detail);
+  return String(dayKey) >= String(cutoffDay);
+}
+
+function pruneTokenStatsMetadata(store, cutoffDay) {
+  const retainedStatsKeys = new Set(Object.keys(store.accounts || {}));
+  const retainedTemporaryKeys = new Set();
+  const currentEntries = listAuthAccountEntries();
+
+  for (const entry of currentEntries) {
+    const statsKey = buildAccountStatsKey(entry);
+    const temporaryKey = buildTemporaryStatsKey(entry);
+    if (statsKey) retainedStatsKeys.add(statsKey);
+    if (temporaryKey) retainedTemporaryKeys.add(temporaryKey);
+  }
+
+  for (const event of Object.values(store.usageEvents || {})) {
+    if (event && event.statsKey) retainedStatsKeys.add(event.statsKey);
+  }
+
+  for (const [statsKey, meta] of Object.entries(store.accountMeta || {})) {
+    if (!retainedStatsKeys.has(statsKey)) {
+      delete store.accountMeta[statsKey];
+      continue;
+    }
+    if (meta && meta.temporaryKey) retainedTemporaryKeys.add(meta.temporaryKey);
+  }
+
+  for (const [temporaryKey, resetState] of Object.entries(store.temporaryAccountResets || {})) {
+    if (!retainedTemporaryKeys.has(temporaryKey)) {
+      delete store.temporaryAccountResets[temporaryKey];
+      continue;
+    }
+    if (resetState && resetState.resetDay && String(resetState.resetDay) < String(cutoffDay)) {
+      resetState.resetDay = cutoffDay;
+      resetState.baseline = createEmptyTokenBreakdown();
+    }
+  }
+}
+
+function pruneTokenStatsStoreRetention(store) {
+  if (!store) return store;
+  const cutoffDay = getTokenStatsRetentionCutoffDayKey();
+  let changed = false;
+  store.retentionDays = TOKEN_STATS_RETENTION_DAYS;
+
+  for (const dayKey of Object.keys(store.daily || {})) {
+    if (String(dayKey) < String(cutoffDay)) {
+      delete store.daily[dayKey];
+      changed = true;
+    }
+  }
+
+  for (const [eventKey, event] of Object.entries(store.usageEvents || {})) {
+    const eventDay = getUsageEventDayKey(event);
+    if (!eventDay || String(eventDay) < String(cutoffDay)) {
+      delete store.usageEvents[eventKey];
+      changed = true;
+    }
+  }
+
+  reconcileTokenStatsStore(store);
+  pruneTokenStatsMetadata(store, cutoffDay);
+  if (changed) {
+    store[TOKEN_STATS_STORE_NEEDS_PERSIST] = true;
+  }
+  return store;
+}
+
 function normalizeDailyEntry(entry) {
   const next = {
     global: mergeTokenBreakdowns(createEmptyTokenBreakdown(), (entry && entry.global) || {}),
@@ -1863,14 +1961,16 @@ function buildDailyDetailRows(store) {
 
       const meta = store.accountMeta[statsKey] || createEmptyAccountMeta();
       const provider = meta.provider || String(statsKey.split('::')[0] || 'unknown');
+      const unattributed = meta.unattributed === true || isUnattributedStatsKey(statsKey);
       rows.push({
         id: `${dayKey}::${statsKey}`,
         day: dayKey,
         statsKey,
         provider,
-        email: meta.email || meta.login || statsKey,
+        email: unattributed ? 'Unattributed account' : (meta.email || meta.login || statsKey),
         login: meta.login || null,
         accountId: meta.accountId || null,
+        unattributed,
         ...breakdown
       });
     }
@@ -1947,6 +2047,7 @@ function buildTokenStatisticsPayload(store) {
     const activeAccount = currentAccounts.find((account) => account.statsKey === statsKey) || null;
     const provider = meta.provider || (activeAccount && activeAccount.type) || String(statsKey.split('::')[0] || 'unknown');
     const temporaryKey = activeAccount ? activeAccount.temporaryKey : meta.temporaryKey;
+    const unattributed = meta.unattributed === true || isUnattributedStatsKey(statsKey);
     const temporary = temporaryKey ? buildTemporaryAccountStats(store, statsKey, temporaryKey) : createEmptyTokenBreakdown();
     const totals = getAccountTotalsFromSource(store, statsKey);
     const history = buildHistorySeries(store, [statsKey]);
@@ -1954,11 +2055,12 @@ function buildTokenStatisticsPayload(store) {
     const record = {
       statsKey,
       provider,
-      email: (activeAccount && activeAccount.email) || meta.email || meta.login || statsKey,
+      email: unattributed ? 'Unattributed account' : ((activeAccount && activeAccount.email) || meta.email || meta.login || statsKey),
       login: (activeAccount && activeAccount.login) || meta.login || null,
       accountId: meta.accountId || null,
       currentAccountId: activeAccount ? activeAccount.id : null,
-      deleted: !activeAccount,
+      deleted: unattributed ? false : !activeAccount,
+      unattributed,
       totals: mergeTokenBreakdowns(createEmptyTokenBreakdown(), totals || {}),
       periodTotals: {
         day: periodStats.day.global,
@@ -2168,7 +2270,7 @@ function normalizeTokenStatsStorePayload(parsed) {
   store.daily = normalizeDailyMap(parsed.daily || {});
   store.usageEvents = normalizeUsageEventIndex(parsed.usageEvents || {});
 
-  return reconcileTokenStatsStore(store);
+  return pruneTokenStatsStoreRetention(store);
 }
 
 function readTokenStatsStoreFile(filePath) {
@@ -2204,6 +2306,7 @@ function readTokenStatsStore(options = {}) {
 
 function writeTokenStatsStore(store) {
   ensureParentDir(TOKEN_STATS_FILE);
+  pruneTokenStatsStoreRetention(store);
   const tempFile = `${TOKEN_STATS_FILE}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tempFile, JSON.stringify(store, null, 2), 'utf8');
@@ -2400,6 +2503,25 @@ function ensureAuthFileAccountMeta(store, authFile, statsKey, provider, accountI
   };
 }
 
+function ensureUnattributedAccountMeta(store, statsKey, provider) {
+  if (!statsKey) return;
+  const existing = store.accountMeta[statsKey] || createEmptyAccountMeta();
+  const now = new Date().toISOString();
+  store.accountMeta[statsKey] = {
+    ...existing,
+    statsKey,
+    provider: provider || existing.provider || 'unknown',
+    email: existing.email || 'Unattributed account',
+    login: existing.login || null,
+    accountId: existing.accountId || null,
+    firstSeenAt: existing.firstSeenAt || now,
+    lastSeenAt: now,
+    lastKnownAccountId: existing.lastKnownAccountId || null,
+    deletedAt: null,
+    unattributed: true
+  };
+}
+
 function buildCliProxyUsageAccountIndexes(store, entries, authFiles = []) {
   const indexes = {
     byAuthIndex: new Map(),
@@ -2528,6 +2650,19 @@ function resolveCliProxyUsageAccountRecord(detail, model, indexes) {
   const provider = getUsageDetailProvider(detail, model);
   const providerEntries = provider ? indexes.entriesByProvider.get(provider) || [] : [];
   return providerEntries.length === 1 ? providerEntries[0] : null;
+}
+
+function buildUnattributedUsageAccountRecord(store, detail, model) {
+  const provider = getUsageDetailProvider(detail, model) || 'unknown';
+  const statsKey = buildUnattributedStatsKey(provider);
+  ensureUnattributedAccountMeta(store, statsKey, provider);
+  return {
+    statsKey,
+    entry: null,
+    temporaryKey: null,
+    provider,
+    unattributed: true
+  };
 }
 
 function getCliProxyUsageDetailDate(detail) {
@@ -2765,7 +2900,11 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
   const nextUsageEvents = { ...existingUsageEvents };
   const indexes = buildCliProxyUsageAccountIndexes(rebuiltStore, entries, authFiles);
   const sourceEvents = collectCliProxyUsageDetails(usageRoot);
-  const events = sourceEvents.filter((event) => shouldIncludeUsageDetailAfterReset(store, event.detail));
+  const retentionCutoffDay = getTokenStatsRetentionCutoffDayKey();
+  const events = sourceEvents.filter((event) =>
+    shouldIncludeUsageDetailAfterReset(store, event.detail) &&
+    shouldIncludeUsageDetailAfterRetention(event.detail, retentionCutoffDay)
+  );
   const hasExistingEventIndex = Object.keys(existingUsageEvents).length > 0;
   const hasTokenEvents = events.some((event) => hasTokenBreakdownTokens(normalizeCliProxyUsageDetailBreakdown(event.detail)));
   const rebuildFromDetailedEvents = hasTokenEvents && !hasExistingEventIndex;
@@ -2785,7 +2924,8 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
 
     const dayKey = getCliProxyUsageDetailDayKey(event.detail);
     const eventKey = buildUsageEventKey(event, breakdown);
-    const accountRecord = resolveCliProxyUsageAccountRecord(event.detail, event.model, indexes);
+    const accountRecord = resolveCliProxyUsageAccountRecord(event.detail, event.model, indexes)
+      || buildUnattributedUsageAccountRecord(rebuiltStore, event.detail, event.model);
     const existingEvent = eventKey ? nextUsageEvents[eventKey] : null;
     if (existingEvent) {
       if (!accountRecord || !accountRecord.statsKey) {
@@ -2850,7 +2990,7 @@ function syncCliProxyUsageStatistics(store, payload, authFiles = []) {
     applyCliProxyDetailedStore(store, rebuiltStore);
     store.usageEvents = nextUsageEvents;
     store.updatedAt = now;
-    reconcileTokenStatsStore(store);
+    pruneTokenStatsStoreRetention(store);
     return { success: true, detailed: true, detailCount: events.length, attributedCount };
   }
 

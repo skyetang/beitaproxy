@@ -92,6 +92,17 @@ function createUsageRenderer({
     return `<div class="usage-row"><span class="usage-label">${escapeHtml(label)}</span><span class="usage-value">${value}</span></div>`;
   }
 
+  function renderAccountDetailTabs(accountId, activeTab = 'usage', options = {}) {
+    const safeId = sanitizeForAttribute(accountId);
+    const showUsageTab = options.showUsageTab !== false;
+    const buttons = [];
+    if (showUsageTab) {
+      buttons.push(`<button type="button" class="language-btn ${activeTab === 'usage' ? 'active' : ''}" onclick="setAccountDetailTab('${safeId}', 'usage')">${escapeHtml(t('usage.usageTab'))}</button>`);
+    }
+    buttons.push(`<button type="button" class="language-btn ${activeTab === 'tokens' ? 'active' : ''}" onclick="setAccountDetailTab('${safeId}', 'tokens')">${escapeHtml(t('usage.tokenTab'))}</button>`);
+    return `<div class="account-detail-tabs">${buttons.join('')}</div>`;
+  }
+
   function renderWindowPill(window, fallback) {
     if (!window || window.remainingPercent == null) return '';
     const title = getWindowRemainingLabel(window, fallback);
@@ -111,7 +122,7 @@ function createUsageRenderer({
   function renderUsageState(accountId, activeTab = 'usage') {
     const state = usageStates[accountId] || {};
     const safeId = sanitizeForAttribute(accountId);
-    const tabHeader = `<div class="account-detail-tabs"><button type="button" class="language-btn ${activeTab === 'usage' ? 'active' : ''}" onclick="setAccountDetailTab('${safeId}', 'usage')">${escapeHtml(t('usage.usageTab'))}</button><button type="button" class="language-btn ${activeTab === 'tokens' ? 'active' : ''}" onclick="setAccountDetailTab('${safeId}', 'tokens')">${escapeHtml(t('usage.tokenTab'))}</button></div>`;
+    const tabHeader = renderAccountDetailTabs(accountId, activeTab);
     const usage = state.usage || {};
 
     if (!state.loading && !state.error && !state.usage) {
@@ -310,7 +321,7 @@ function createUsageRenderer({
     const state = temporaryStats || {};
     const stats = state.stats || {};
     const safeAccountId = sanitizeForAttribute(account.id || '');
-    const tabHeader = `<div class="account-detail-tabs"><button type="button" class="language-btn ${activeTab === 'usage' ? 'active' : ''}" onclick="setAccountDetailTab('${sanitizeForAttribute(account.id)}', 'usage')">${escapeHtml(t('usage.usageTab'))}</button><button type="button" class="language-btn ${activeTab === 'tokens' ? 'active' : ''}" onclick="setAccountDetailTab('${sanitizeForAttribute(account.id)}', 'tokens')">${escapeHtml(t('usage.tokenTab'))}</button></div>`;
+    const tabHeader = renderAccountDetailTabs(account.id || '', activeTab, { showUsageTab: account.type === 'codex' });
     if (!state.loading && !state.error && !state.stats) {
       return `<div class="usage-card compact-usage-card temporary-token-card">${tabHeader}<div class="usage-note">${escapeHtml(t('usage.querying'))}</div></div>`;
     }
@@ -346,7 +357,13 @@ function createUsageRenderer({
 
   function getServiceName(provider, services) {
     const service = (services || []).find((item) => item.type === provider);
+    if (!service && provider === 'unknown') return t('tokenStats.unknownProvider');
     return service ? service.name : String(provider || t('common.unknown'));
+  }
+
+  function getAccountDisplayName(record) {
+    if (record && record.unattributed) return t('tokenStats.unattributedAccount');
+    return (record && (record.email || record.statsKey)) || t('common.unknown');
   }
 
   function renderMetricHeaderCells() {
@@ -453,12 +470,12 @@ function createUsageRenderer({
     for (const record of (stats && stats.historicalAccounts) || []) {
       if (!record || !record.statsKey) continue;
       const serviceName = getServiceName(record.provider, services);
-      options.set(record.statsKey, `${serviceName} · ${record.email || record.statsKey}`);
+      options.set(record.statsKey, `${serviceName} · ${getAccountDisplayName(record)}`);
     }
     for (const row of rows || []) {
       if (!row || !row.statsKey || options.has(row.statsKey)) continue;
       const serviceName = getServiceName(row.provider, services);
-      options.set(row.statsKey, `${serviceName} · ${row.email || row.statsKey}`);
+      options.set(row.statsKey, `${serviceName} · ${getAccountDisplayName(row)}`);
     }
     if (selectedAccount && !options.has(selectedAccount)) {
       options.set(selectedAccount, selectedAccount);
@@ -490,7 +507,7 @@ function createUsageRenderer({
     const rowsHtml = pageRows.map((row) => `<tr>
       <td class="token-date-cell">${escapeHtml(row.day || '')}</td>
       <td class="token-provider-cell">${escapeHtml(getServiceName(row.provider, services))}</td>
-      <td class="token-account-cell">${escapeHtml(row.email || row.statsKey || '')}</td>
+      <td class="token-account-cell">${escapeHtml(getAccountDisplayName(row))}</td>
       ${renderMetricCells(row)}
     </tr>`).join('');
     const tableBody = rowsHtml || `<tr><td colspan="9" class="token-empty-cell">${escapeHtml(t('tokenStats.dailyTableEmpty'))}</td></tr>`;
@@ -524,8 +541,16 @@ function createUsageRenderer({
     const periodStats = stats.periods && stats.periods[activePeriod] ? stats.periods[activePeriod] : null;
     const summary = renderTokenStatsSummary(state, activePeriod);
     const chart = renderLineChart((periodStats && periodStats.history) || (stats.history7d && stats.history7d.global) || [], t('tokenStats.chartTitleForPeriod', { period: t(`tokenStats.period${activePeriod.charAt(0).toUpperCase()}${activePeriod.slice(1)}`) }));
+    const knownServiceTypes = new Set((services || []).map((service) => service.type));
+    const extraServices = Object.keys(historicalByProvider || {})
+      .filter((provider) => provider && !knownServiceTypes.has(provider))
+      .sort()
+      .map((provider) => ({
+        type: provider,
+        name: provider === 'unknown' ? t('tokenStats.unknownProvider') : getServiceName(provider, services)
+      }));
 
-    const sections = (services || []).map((service) => {
+    const sections = [...(services || []), ...extraServices].map((service) => {
       const records = (historicalByProvider && historicalByProvider[service.type]) || [];
       if (records.length === 0) return '';
 
@@ -533,14 +558,16 @@ function createUsageRenderer({
         const totals = record.totals || {};
         const hasStats = (totals.totalTokens || totals.inputTokens || totals.outputTokens || totals.cachedTokens || totals.reasoningTokens || totals.requestCount);
         const titleClass = record.deleted ? 'token-account-name historical' : 'token-account-name';
-        const subtitle = record.deleted ? `${service.name} · ${t('tokenStats.historyAccount')}` : service.name;
+        const subtitle = record.unattributed
+          ? `${service.name} · ${t('tokenStats.unattributedBadge')}`
+          : (record.deleted ? `${service.name} · ${t('tokenStats.historyAccount')}` : service.name);
         const safeStatsKey = sanitizeForAttribute(record.statsKey || '');
         const isExpanded = expandedTokenAccounts && expandedTokenAccounts.has(record.statsKey);
 
         return `<div class="usage-card token-account-card compact-usage-card ${record.deleted ? 'historical-account-card' : ''}">
           <button class="usage-header" type="button" onclick="toggleTokenAccountExpand('${safeStatsKey}')">
             <div class="usage-heading">
-              <span class="usage-title ${titleClass}">${escapeHtml(record.email || record.statsKey)}</span>
+              <span class="usage-title ${titleClass}">${escapeHtml(getAccountDisplayName(record))}</span>
               <span class="usage-subtitle">${escapeHtml(subtitle)}</span>
             </div>
             <span class="usage-toggle"><span>${isExpanded ? t('usage.collapse') : t('usage.expand')}</span><span class="chevron ${isExpanded ? 'expanded' : ''}">▶</span></span>

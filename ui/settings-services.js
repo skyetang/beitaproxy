@@ -187,8 +187,7 @@ function createServicesController({
 
         for (const account of svcAccounts) {
           const safeId = sanitizeForAttribute(account.id);
-          const usageState = usageStates[account.id];
-          const detailTab = getAccountDetailTab(account.id);
+          const detailTab = account.type === 'codex' ? getAccountDetailTab(account.id) : 'tokens';
           const temporaryStats = temporaryTokenStates[account.id] || { loading: false, error: null, stats: account.temporaryKey ? (temporaryStatsMap[account.temporaryKey] || {}) : {} };
           const canToggleDisabled = svcAccounts.length > 1;
           const disableBlocked = !account.disabled && enabledAccountCount <= 1;
@@ -224,9 +223,9 @@ function createServicesController({
                   <button class="danger" onclick="removeAccountById('${safeId}')">${t('services.remove')}</button>
                 </div>
               </div>
-              ${isDetailExpanded ? (detailTab === 'tokens'
-                ? renderTemporaryTokenState(account, temporaryStats, detailTab)
-                : renderUsageState(account.id, detailTab)) : ''}
+              ${isDetailExpanded ? (detailTab === 'usage' && account.type === 'codex'
+                ? renderUsageState(account.id, detailTab)
+                : renderTemporaryTokenState(account, temporaryStats, detailTab)) : ''}
             </div>`;
         }
 
