@@ -35,6 +35,7 @@ const CODEX_LOCAL_AUTH_FILE = path.join(os.homedir(), '.codex', 'auth.json');
 const APP_VERSION = '1.0.1';
 const CONFIG_FILE = path.join(AUTH_DIR, 'beitaproxy-config.json');
 const TOKEN_STATS_FILE = path.join(app.getPath('userData'), 'token-stats.json');
+const TOKEN_STATS_DB_FILE = path.join(app.getPath('userData'), 'token-stats.sqlite');
 const TOKEN_STATS_STORE_VERSION = 3;
 const TOKEN_STATS_STORE_NEEDS_PERSIST = Symbol('tokenStatsStoreNeedsPersist');
 const UNATTRIBUTED_ACCOUNT_ID = '__unattributed__';
@@ -68,6 +69,17 @@ let tokenStatsSyncActivePromise = null;
 let tokenStatsStoreQueue = Promise.resolve();
 let quitCleanupComplete = false;
 let quitCleanupPromise = null;
+let authEntriesCache = {
+  signature: null,
+  entries: null
+};
+let tokenStatsSqliteState = {
+  checked: false,
+  binding: null,
+  db: null,
+  warned: false,
+  disabled: false
+};
 
 // OAuth provider keys mapping (same as Swift version)
 const OAUTH_PROVIDER_KEYS = {
@@ -301,9 +313,37 @@ function readAuthFile(filePath) {
 function writeAuthFile(filePath, data) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
   try { fs.chmodSync(filePath, 0o600); } catch (e) {}
+  invalidateAuthEntriesCache();
 }
 
-function listAuthAccountEntries(serviceType = null) {
+function invalidateAuthEntriesCache() {
+  authEntriesCache = {
+    signature: null,
+    entries: null
+  };
+}
+
+function getAuthEntriesSignature() {
+  ensureAuthDir();
+  const files = fs.readdirSync(AUTH_DIR)
+    .filter((file) => file.endsWith('.json'))
+    .sort((a, b) => String(a || '').localeCompare(String(b || '')));
+  const parts = [];
+
+  for (const file of files) {
+    try {
+      const filePath = path.join(AUTH_DIR, file);
+      const stat = fs.statSync(filePath);
+      parts.push(`${file}:${stat.size}:${stat.mtimeMs}`);
+    } catch (e) {
+      parts.push(`${file}:missing`);
+    }
+  }
+
+  return parts.join('|');
+}
+
+function readAllAuthAccountEntries() {
   const entries = [];
   ensureAuthDir();
 
@@ -318,7 +358,6 @@ function listAuthAccountEntries(serviceType = null) {
         const stat = fs.statSync(filePath);
         const mappedType = mapAuthTypeToService(data.type);
         if (!mappedType) continue;
-        if (serviceType && mappedType !== serviceType) continue;
         const createdAt = stat && Number.isFinite(stat.birthtimeMs) && stat.birthtimeMs > 0
           ? stat.birthtime.toISOString()
           : (stat && stat.mtime ? stat.mtime.toISOString() : null);
@@ -335,6 +374,39 @@ function listAuthAccountEntries(serviceType = null) {
   } catch (e) {}
 
   return entries.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+}
+
+function listAuthAccountEntries(serviceType = null) {
+  try {
+    const signature = getAuthEntriesSignature();
+    if (!authEntriesCache.entries || authEntriesCache.signature !== signature) {
+      authEntriesCache = {
+        signature,
+        entries: readAllAuthAccountEntries()
+      };
+    }
+  } catch (e) {
+    authEntriesCache = {
+      signature: null,
+      entries: readAllAuthAccountEntries()
+    };
+  }
+
+  const entries = authEntriesCache.entries || [];
+  return serviceType
+    ? entries.filter((entry) => entry.type === serviceType)
+    : entries;
+}
+
+function normalizeAccountPriority(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.max(0, Math.min(9999, Math.round(numeric)));
+}
+
+function getAccountPriority(data) {
+  if (!data || typeof data !== 'object') return 0;
+  return normalizeAccountPriority(data.priority ?? data.weight ?? 0);
 }
 
 function createAuthEntrySnapshot(serviceType) {
@@ -806,6 +878,7 @@ function syncKiroTokenFromIDE() {
         authData.last_synced = new Date().toISOString();
         fs.writeFileSync(filePath, JSON.stringify(authData, null, 2));
         fs.chmodSync(filePath, 0o600);
+        invalidateAuthEntriesCache();
         updated++;
         console.log(`[Kiro] Synced token from IDE: ${file} (expires: ${kiroToken.expiresAt})`);
       } catch (e) {
@@ -881,6 +954,7 @@ function importKiroToken() {
     const filePath = path.join(AUTH_DIR, filename);
     fs.writeFileSync(filePath, JSON.stringify(authData, null, 2));
     fs.chmodSync(filePath, 0o600);
+    invalidateAuthEntriesCache();
 
     console.log(`[Kiro] Token imported from Kiro IDE with refresh token: ${filename}`);
     getConfigPath();
@@ -919,6 +993,7 @@ function getAuthAccounts() {
       expired,
       expiredDate: data.expired,
       disabled: data.disabled === true,
+      priority: getAccountPriority(data),
       path: entry.filePath,
       statsKey,
       temporaryKey
@@ -1001,6 +1076,29 @@ function designateAccountForUse(accountId) {
   }
 }
 
+function setAccountPriority(accountId, priority) {
+  try {
+    const entry = findAuthAccountEntry(accountId);
+    if (!entry) {
+      return { success: false, error: 'Account not found' };
+    }
+
+    entry.data.priority = normalizeAccountPriority(priority);
+    writeAuthFile(entry.filePath, entry.data);
+    getConfigPath();
+    requestRestartAfterConfigChange();
+
+    return {
+      success: true,
+      accountId,
+      type: entry.type,
+      priority: entry.data.priority
+    };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
 async function deleteAccount(filePath) {
   try {
     const entry = listAuthAccountEntries().find((item) => item.filePath === filePath);
@@ -1023,6 +1121,7 @@ async function deleteAccount(filePath) {
       });
     }
     fs.unlinkSync(filePath);
+    invalidateAuthEntriesCache();
     getConfigPath();
     requestRestartAfterConfigChange();
     return true;
@@ -1097,6 +1196,7 @@ function saveZaiApiKey(apiKey) {
   const filePath = path.join(AUTH_DIR, filename);
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
   fs.chmodSync(filePath, 0o600);
+  invalidateAuthEntriesCache();
   getConfigPath();
   requestRestartAfterConfigChange();
   return true;
@@ -1212,7 +1312,8 @@ function importCodexLocalAuth() {
       last_refresh: localAuth.last_refresh || new Date().toISOString(),
       imported_from: 'codex-local',
       auth_source_path: result.filePath,
-      disabled: existingEntry ? existingEntry.data.disabled === true : false
+      disabled: existingEntry ? existingEntry.data.disabled === true : false,
+      priority: existingEntry ? getAccountPriority(existingEntry.data) : 0
     };
 
     if (existingEntry && existingEntry.data.created) {
@@ -2273,6 +2374,282 @@ function normalizeTokenStatsStorePayload(parsed) {
   return pruneTokenStatsStoreRetention(store);
 }
 
+function getTokenStatsSqliteBinding() {
+  if (tokenStatsSqliteState.disabled) return null;
+  if (tokenStatsSqliteState.checked) return tokenStatsSqliteState.binding;
+
+  tokenStatsSqliteState.checked = true;
+  try {
+    const binding = require('node:sqlite');
+    if (binding && binding.DatabaseSync) {
+      tokenStatsSqliteState.binding = binding;
+    }
+  } catch (e) {
+    tokenStatsSqliteState.binding = null;
+  }
+  return tokenStatsSqliteState.binding;
+}
+
+function isTokenStatsSqliteEnabled() {
+  return !!getTokenStatsSqliteBinding();
+}
+
+function getTokenStatsSqliteDb() {
+  const binding = getTokenStatsSqliteBinding();
+  if (!binding) return null;
+  if (tokenStatsSqliteState.db) return tokenStatsSqliteState.db;
+
+  ensureParentDir(TOKEN_STATS_DB_FILE);
+  const db = new binding.DatabaseSync(TOKEN_STATS_DB_FILE);
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA synchronous = NORMAL');
+  initializeTokenStatsSqliteSchema(db);
+  tokenStatsSqliteState.db = db;
+  return db;
+}
+
+function initializeTokenStatsSqliteSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS token_stats_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+    CREATE TABLE IF NOT EXISTS token_stats_account_meta (
+      stats_key TEXT PRIMARY KEY,
+      payload TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS token_stats_daily_global (
+      day_key TEXT PRIMARY KEY,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      request_count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS token_stats_daily_accounts (
+      day_key TEXT NOT NULL,
+      stats_key TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      request_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day_key, stats_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_token_stats_daily_accounts_stats_day
+      ON token_stats_daily_accounts (stats_key, day_key);
+    CREATE TABLE IF NOT EXISTS token_stats_usage_events (
+      event_key TEXT PRIMARY KEY,
+      day_key TEXT,
+      stats_key TEXT,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      request_count INTEGER NOT NULL DEFAULT 0,
+      seen_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_token_stats_usage_events_day
+      ON token_stats_usage_events (day_key);
+    CREATE INDEX IF NOT EXISTS idx_token_stats_usage_events_stats
+      ON token_stats_usage_events (stats_key);
+    CREATE TABLE IF NOT EXISTS token_stats_temporary_resets (
+      temporary_key TEXT PRIMARY KEY,
+      reset_at TEXT,
+      reset_day TEXT,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      request_count INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+}
+
+function rowToTokenBreakdown(row) {
+  return mergeTokenBreakdowns(createEmptyTokenBreakdown(), {
+    inputTokens: row && row.input_tokens,
+    outputTokens: row && row.output_tokens,
+    cachedTokens: row && row.cached_tokens,
+    reasoningTokens: row && row.reasoning_tokens,
+    totalTokens: row && row.total_tokens,
+    requestCount: row && row.request_count
+  });
+}
+
+function getTokenBreakdownSqlParams(value) {
+  const breakdown = mergeTokenBreakdowns(createEmptyTokenBreakdown(), value || {});
+  return [
+    sanitizeTokenCount(breakdown.inputTokens),
+    sanitizeTokenCount(breakdown.outputTokens),
+    sanitizeTokenCount(breakdown.cachedTokens),
+    sanitizeTokenCount(breakdown.reasoningTokens),
+    sanitizeTokenCount(breakdown.totalTokens),
+    sanitizeTokenCount(breakdown.requestCount)
+  ];
+}
+
+function runTokenStatsSqliteTransaction(db, task) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = task();
+    db.exec('COMMIT');
+    return result;
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch (rollbackError) {}
+    throw e;
+  }
+}
+
+function readTokenStatsStoreSqlite() {
+  const db = getTokenStatsSqliteDb();
+  if (!db) return null;
+
+  const metaRows = db.prepare('SELECT key, value FROM token_stats_meta').all();
+  const metadata = Object.fromEntries(metaRows.map((row) => [row.key, row.value]));
+  if (!metadata.version) return null;
+
+  const parsed = {
+    version: Number(metadata.version),
+    updatedAt: metadata.updatedAt || null,
+    usageResetAt: metadata.usageResetAt || null,
+    temporaryAccountResets: {},
+    accountMeta: {},
+    daily: {},
+    usageEvents: {}
+  };
+
+  for (const row of db.prepare('SELECT stats_key, payload FROM token_stats_account_meta').all()) {
+    try {
+      parsed.accountMeta[row.stats_key] = JSON.parse(row.payload);
+    } catch (e) {}
+  }
+
+  for (const row of db.prepare('SELECT * FROM token_stats_daily_global').all()) {
+    parsed.daily[row.day_key] = parsed.daily[row.day_key] || {
+      global: createEmptyTokenBreakdown(),
+      accounts: {}
+    };
+    parsed.daily[row.day_key].global = rowToTokenBreakdown(row);
+  }
+
+  for (const row of db.prepare('SELECT * FROM token_stats_daily_accounts').all()) {
+    parsed.daily[row.day_key] = parsed.daily[row.day_key] || {
+      global: createEmptyTokenBreakdown(),
+      accounts: {}
+    };
+    parsed.daily[row.day_key].accounts[row.stats_key] = rowToTokenBreakdown(row);
+  }
+
+  for (const row of db.prepare('SELECT * FROM token_stats_usage_events').all()) {
+    parsed.usageEvents[row.event_key] = {
+      day: row.day_key || null,
+      statsKey: row.stats_key || null,
+      breakdown: rowToTokenBreakdown(row),
+      totalTokens: sanitizeTokenCount(row.total_tokens),
+      requestCount: sanitizeTokenCount(row.request_count),
+      seenAt: row.seen_at || null
+    };
+  }
+
+  for (const row of db.prepare('SELECT * FROM token_stats_temporary_resets').all()) {
+    parsed.temporaryAccountResets[row.temporary_key] = {
+      resetAt: row.reset_at || null,
+      resetDay: row.reset_day || null,
+      baseline: rowToTokenBreakdown(row)
+    };
+  }
+
+  return normalizeTokenStatsStorePayload(parsed);
+}
+
+function writeTokenStatsStoreSqlite(store) {
+  const db = getTokenStatsSqliteDb();
+  if (!db) return false;
+
+  pruneTokenStatsStoreRetention(store);
+
+  runTokenStatsSqliteTransaction(db, () => {
+    db.prepare('DELETE FROM token_stats_meta').run();
+    db.prepare('DELETE FROM token_stats_account_meta').run();
+    db.prepare('DELETE FROM token_stats_daily_global').run();
+    db.prepare('DELETE FROM token_stats_daily_accounts').run();
+    db.prepare('DELETE FROM token_stats_usage_events').run();
+    db.prepare('DELETE FROM token_stats_temporary_resets').run();
+
+    const insertMeta = db.prepare('INSERT INTO token_stats_meta (key, value) VALUES (?, ?)');
+    insertMeta.run('version', String(TOKEN_STATS_STORE_VERSION));
+    insertMeta.run('retentionDays', String(TOKEN_STATS_RETENTION_DAYS));
+    insertMeta.run('updatedAt', store.updatedAt || '');
+    insertMeta.run('usageResetAt', store.usageResetAt || '');
+
+    const insertAccountMeta = db.prepare('INSERT INTO token_stats_account_meta (stats_key, payload) VALUES (?, ?)');
+    for (const [statsKey, meta] of Object.entries(store.accountMeta || {})) {
+      insertAccountMeta.run(statsKey, JSON.stringify(meta || {}));
+    }
+
+    const insertDailyGlobal = db.prepare(`
+      INSERT INTO token_stats_daily_global
+      (day_key, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, request_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertDailyAccount = db.prepare(`
+      INSERT INTO token_stats_daily_accounts
+      (day_key, stats_key, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, request_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const [dayKey, dayEntry] of Object.entries(store.daily || {})) {
+      insertDailyGlobal.run(dayKey, ...getTokenBreakdownSqlParams(dayEntry && dayEntry.global));
+      for (const [statsKey, totals] of Object.entries((dayEntry && dayEntry.accounts) || {})) {
+        insertDailyAccount.run(dayKey, statsKey, ...getTokenBreakdownSqlParams(totals));
+      }
+    }
+
+    const insertUsageEvent = db.prepare(`
+      INSERT INTO token_stats_usage_events
+      (event_key, day_key, stats_key, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, request_count, seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const [eventKey, event] of Object.entries(store.usageEvents || {})) {
+      insertUsageEvent.run(
+        eventKey,
+        event && event.day ? String(event.day) : null,
+        event && event.statsKey ? String(event.statsKey) : null,
+        ...getTokenBreakdownSqlParams(event && event.breakdown),
+        event && event.seenAt ? String(event.seenAt) : null
+      );
+    }
+
+    const insertTemporaryReset = db.prepare(`
+      INSERT INTO token_stats_temporary_resets
+      (temporary_key, reset_at, reset_day, input_tokens, output_tokens, cached_tokens, reasoning_tokens, total_tokens, request_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const [temporaryKey, resetState] of Object.entries(store.temporaryAccountResets || {})) {
+      insertTemporaryReset.run(
+        temporaryKey,
+        resetState && resetState.resetAt ? String(resetState.resetAt) : null,
+        resetState && resetState.resetDay ? String(resetState.resetDay) : null,
+        ...getTokenBreakdownSqlParams(resetState && resetState.baseline)
+      );
+    }
+  });
+
+  return true;
+}
+
+function closeTokenStatsSqliteDatabase() {
+  if (!tokenStatsSqliteState.db) return;
+  try {
+    tokenStatsSqliteState.db.close();
+  } catch (e) {}
+  tokenStatsSqliteState.db = null;
+}
+
 function readTokenStatsStoreFile(filePath) {
   if (!fs.existsSync(filePath)) return null;
   const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -2293,6 +2670,28 @@ function persistTokenStatsStoreIfNeeded(store, shouldPersist = false) {
 
 function readTokenStatsStore(options = {}) {
   const shouldPersist = options.persistResetBoundary === true;
+  if (isTokenStatsSqliteEnabled()) {
+    try {
+      const sqliteStore = readTokenStatsStoreSqlite();
+      if (sqliteStore) return persistTokenStatsStoreIfNeeded(sqliteStore, shouldPersist);
+
+      const legacyStore = readTokenStatsStoreFile(TOKEN_STATS_FILE);
+      if (legacyStore) {
+        writeTokenStatsStoreSqlite(legacyStore);
+        return persistTokenStatsStoreIfNeeded(legacyStore, shouldPersist);
+      }
+
+      return persistTokenStatsStoreIfNeeded(createPersistedResetTokenStatsStore(), shouldPersist);
+    } catch (e) {
+      if (!tokenStatsSqliteState.warned) {
+        tokenStatsSqliteState.warned = true;
+        console.warn('[TokenStats] SQLite unavailable, falling back to JSON store:', e.message);
+      }
+      tokenStatsSqliteState.disabled = true;
+      closeTokenStatsSqliteDatabase();
+    }
+  }
+
   try {
     const store = readTokenStatsStoreFile(TOKEN_STATS_FILE);
     if (store) return persistTokenStatsStoreIfNeeded(store, shouldPersist);
@@ -2304,7 +2703,7 @@ function readTokenStatsStore(options = {}) {
   return persistTokenStatsStoreIfNeeded(createPersistedResetTokenStatsStore(), shouldPersist);
 }
 
-function writeTokenStatsStore(store) {
+function writeTokenStatsStoreJson(store) {
   ensureParentDir(TOKEN_STATS_FILE);
   pruneTokenStatsStoreRetention(store);
   const tempFile = `${TOKEN_STATS_FILE}.${process.pid}.${Date.now()}.tmp`;
@@ -2317,6 +2716,22 @@ function writeTokenStatsStore(store) {
     throw e;
   }
   try { fs.chmodSync(TOKEN_STATS_FILE, 0o600); } catch (e) {}
+}
+
+function writeTokenStatsStore(store) {
+  if (isTokenStatsSqliteEnabled()) {
+    try {
+      if (writeTokenStatsStoreSqlite(store)) return;
+    } catch (e) {
+      if (!tokenStatsSqliteState.warned) {
+        tokenStatsSqliteState.warned = true;
+        console.warn('[TokenStats] Failed to write SQLite store, falling back to JSON:', e.message);
+      }
+      tokenStatsSqliteState.disabled = true;
+      closeTokenStatsSqliteDatabase();
+    }
+  }
+  writeTokenStatsStoreJson(store);
 }
 
 function queueTokenStatsStoreUpdate(task) {
@@ -3403,6 +3818,7 @@ async function startBackendServer() {
       serverProcess = null;
       isServerRunning = false;
       updateTray();
+      notifyServerStatus('backend-exit');
     }
   });
 
@@ -3455,6 +3871,7 @@ async function startServerInternal() {
   await waitForPort('127.0.0.1', BACKEND_PORT);
   isServerRunning = true;
   updateTray();
+  notifyServerStatus('started');
   showNotification('Server Started', `BeitaProxy is running on port ${PROXY_PORT}`);
 }
 
@@ -3464,6 +3881,7 @@ async function stopServerInternal() {
   await stopBackendServer();
   isServerRunning = false;
   updateTray();
+  notifyServerStatus('stopped');
 }
 
 function startServer() {
@@ -3756,7 +4174,8 @@ const {
   createTray,
   updateTray,
   openDashboard,
-  openSettings
+  openSettings,
+  sendSettingsEvent
 } = createAppUiController({
   app,
   fs,
@@ -3768,6 +4187,15 @@ const {
   proxyPort: PROXY_PORT,
   backendPort: BACKEND_PORT
 });
+
+function notifyServerStatus(reason = 'changed') {
+  if (typeof sendSettingsEvent !== 'function') return;
+  sendSettingsEvent('server-status-changed', {
+    running: isServerRunning,
+    reason,
+    timestamp: new Date().toISOString()
+  });
+}
 
 // ============== App Lifecycle ==============
 
@@ -3804,6 +4232,7 @@ async function cleanupBeforeQuit() {
   stopObservedInputMonitoring();
   stopKiroAutoSync();
   await stopServer();
+  closeTokenStatsSqliteDatabase();
 }
 
 app.on('before-quit', (event) => {
@@ -3845,6 +4274,7 @@ global.beitaProxy = {
   getAuthAccounts,
   toggleAccountDisabled,
   designateAccountForUse,
+  setAccountPriority,
   deleteAccount,
   checkCodexLocalAuth,
   getCodexLocalAuthStatus,

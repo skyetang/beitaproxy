@@ -2,6 +2,8 @@ function createServicesController({
   vp,
   shell,
   services,
+  getAccounts: getAccountsSnapshot,
+  getTokenStats: getTokenStatsSnapshot,
   t,
   escapeHtml,
   sanitizeForAttribute,
@@ -27,7 +29,7 @@ function createServicesController({
   }
 
   function getAccounts() {
-    return vp.getAuthAccounts();
+    return getAccountsSnapshot ? getAccountsSnapshot() : vp.getAuthAccounts();
   }
 
   function getVisibleServices(accounts) {
@@ -136,18 +138,20 @@ function createServicesController({
   function renderServices() {
     const accounts = getAccounts();
     const visibleServices = getVisibleServices(accounts);
-    const tokenStatsResult = vp.getTokenStatistics ? vp.getTokenStatistics() : { success: false };
+    const tokenStatsResult = getTokenStatsSnapshot
+      ? getTokenStatsSnapshot()
+      : (vp.getTokenStatistics ? vp.getTokenStatistics() : { success: false });
     const temporaryStatsMap = tokenStatsResult && tokenStatsResult.success && tokenStatsResult.stats && tokenStatsResult.stats.temporaryAccounts
       ? tokenStatsResult.stats.temporaryAccounts
       : {};
     const container = document.getElementById('services');
-    container.innerHTML = '';
 
     if (visibleServices.length === 0) {
-      container.innerHTML += `<div class="no-accounts">${escapeHtml(t('services.noAccountsAdded'))}</div>`;
+      container.innerHTML = `<div class="no-accounts">${escapeHtml(t('services.noAccountsAdded'))}</div>`;
       return;
     }
 
+    const chunks = [];
     for (const svc of visibleServices) {
       const svcAccounts = accounts.filter((account) => account.type === svc.type);
       const enabled = vp.isProviderEnabled(svc.type);
@@ -194,6 +198,7 @@ function createServicesController({
           const dotClass = account.disabled ? 'gray' : (account.expired ? 'orange' : 'green');
           const isDetailExpanded = expandedUsage.has(account.id);
           const isDesignated = designatedAccountId === account.id;
+          const priority = Number.isFinite(Number(account.priority)) ? Math.max(0, Math.round(Number(account.priority))) : 0;
           const labelParts = [];
           if (isDesignated) {
             labelParts.push(t('services.designatedAccount'));
@@ -210,6 +215,10 @@ function createServicesController({
               <div class="account-line account-line-with-actions">
                 <span class="dot ${isDesignated ? 'green' : dotClass}"></span>
                 <span class="account-email ${account.expired ? 'expired' : ''} ${account.disabled ? 'disabled' : ''} ${isDesignated ? 'designated' : ''}">${escapeHtml(account.email)}${escapeHtml(suffix)}</span>
+                <label class="account-priority-control" title="${escapeHtml(t('services.priorityHint'))}">
+                  <span>${escapeHtml(t('services.priority'))}</span>
+                  <input type="number" min="0" max="9999" step="1" value="${priority}" onchange="setAccountPriority('${safeId}', this.value)" onclick="event.stopPropagation()">
+                </label>
                 <div class="account-actions inline">
                   <button class="plain account-expand-btn account-action-btn" onclick="toggleAccountDetails('${safeId}')">${isDetailExpanded ? t('usage.collapse') : t('usage.expand')}</button>
                   <button class="account-action-btn ${isDesignated ? 'account-designated-btn' : 'secondary account-designate-btn'}" ${isDesignated ? 'disabled' : ''} onclick="designateAccountForUse('${safeId}')">${isDesignated ? t('services.designated') : t('services.designate')}</button>
@@ -235,8 +244,10 @@ function createServicesController({
       }
 
       html += '</div>';
-      container.innerHTML += html;
+      chunks.push(html);
     }
+
+    container.innerHTML = chunks.join('');
 
     container.querySelectorAll('.account-token-reset-btn').forEach((button) => {
       button.addEventListener('click', (event) => {
@@ -310,7 +321,24 @@ function createServicesController({
     }
   }
 
-  async function queryCodexUsage(id) {
+  async function setAccountPriority(id, value) {
+    try {
+      const result = vp.setAccountPriority
+        ? vp.setAccountPriority(id, value)
+        : { success: false, error: t('services.priorityFailed') };
+      if (!result || !result.success) {
+        showAlert(t('common.error'), (result && result.error) || t('services.priorityFailed'));
+        rerender({ invalidateAccounts: true });
+        return;
+      }
+      rerender({ invalidateAccounts: true });
+    } catch (e) {
+      showAlert(t('common.error'), e.message || t('services.priorityFailed'));
+      rerender({ invalidateAccounts: true });
+    }
+  }
+
+  async function queryCodexUsage(id, options = {}) {
     const previousState = usageStates[id] || {};
     usageStates[id] = {
       loading: true,
@@ -318,7 +346,9 @@ function createServicesController({
       error: null,
       details: null
     };
-    renderServices();
+    if (!options.deferStartRender) {
+      renderServices();
+    }
 
     try {
       const result = await vp.getCodexUsage(id);
@@ -339,7 +369,9 @@ function createServicesController({
       };
     }
 
-    renderServices();
+    if (!options.deferEndRender) {
+      renderServices();
+    }
   }
 
   async function switchCodexAccount(id) {
@@ -636,6 +668,7 @@ function createServicesController({
     toggleUsageExpand,
     toggleAccountDisabled,
     designateAccountForUse,
+    setAccountPriority,
     queryCodexUsage,
     switchCodexAccount,
     startAddAccountFlow,

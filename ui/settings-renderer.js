@@ -1,4 +1,4 @@
-const { shell } = require('electron');
+const { shell, ipcRenderer } = require('electron');
 const { createUsageRenderer } = require('./settings-usage');
 const { createServicesController } = require('./settings-services');
 let vp;
@@ -26,6 +26,9 @@ const expandedUsage = new Set();
 const expandedTokenAccounts = new Set();
 let activeSection = 'services';
 let currentLanguage = (vp.getLanguagePreference ? vp.getLanguagePreference() : loadLanguagePreference()) || 'zh';
+let serverRunningCache = null;
+let authAccountsCache = null;
+let servicesRenderTimer = null;
 const usageStates = {};
 const temporaryTokenStates = {};
 const accountDetailTabs = {};
@@ -36,6 +39,9 @@ let tokenStatsDailyPage = 1;
 let tokenStatsDailyDate = '';
 let tokenStatsDailyAccount = '';
 const TOKEN_STATS_DAILY_PAGE_SIZE = 10;
+const CODEX_USAGE_QUERY_CONCURRENCY = 2;
+const CODEX_USAGE_QUERY_STAGGER_MS = 180;
+const LIVE_STATUS_FALLBACK_INTERVAL_MS = 15000;
 const codexLocalAuthPath = vp.getCodexLocalAuthPath ? vp.getCodexLocalAuthPath() : '~/.codex/auth.json';
 
 const { renderUsageState, renderTokenStatsPage, renderTemporaryTokenState } = createUsageRenderer({
@@ -49,7 +55,32 @@ const { renderUsageState, renderTokenStatsPage, renderTemporaryTokenState } = cr
 });
 
 function getAccountById(accountId) {
-  return vp.getAuthAccounts ? vp.getAuthAccounts().find((item) => item.id === accountId) : null;
+  return getAuthAccountsSnapshot().find((item) => item.id === accountId) || null;
+}
+
+function getAuthAccountsSnapshot(options = {}) {
+  if (options.force || !authAccountsCache) {
+    authAccountsCache = vp.getAuthAccounts ? vp.getAuthAccounts() : [];
+  }
+  return authAccountsCache;
+}
+
+function invalidateAuthAccountsSnapshot() {
+  authAccountsCache = null;
+}
+
+function getTokenStatsSnapshot() {
+  return tokenStatsState && tokenStatsState.stats
+    ? { success: true, stats: tokenStatsState.stats }
+    : { success: false };
+}
+
+function scheduleServicesRender(delayMs = 80) {
+  if (servicesRenderTimer) return;
+  servicesRenderTimer = setTimeout(() => {
+    servicesRenderTimer = null;
+    renderServices();
+  }, delayMs);
 }
 
 function getAccountDetailTab(accountId) {
@@ -60,21 +91,25 @@ function getAccountDetailTab(accountId) {
 
 function queryDefaultUsageForVisibleAccounts() {
   if (!vp.getAuthAccounts) return;
-  const accounts = vp.getAuthAccounts();
+  const accounts = getAuthAccountsSnapshot();
+  const pendingAccounts = [];
   for (const account of accounts) {
     if (!expandedUsage.has(account.id)) continue;
     if (getAccountDetailTab(account.id) === 'usage' && account.type === 'codex') {
       const state = usageStates[account.id];
       if (!state || (!state.loading && !state.usage && !state.error)) {
-        queryCodexUsage(account.id);
+        pendingAccounts.push(account);
       }
     }
+  }
+  if (pendingAccounts.length > 0) {
+    queryCodexUsageBatch(pendingAccounts);
   }
 }
 
 async function refreshTemporaryTokenState(accountId) {
   if (!accountId || !vp.getAuthAccounts || !vp.getTokenStatistics) return;
-  const account = vp.getAuthAccounts().find((item) => item.id === accountId);
+  const account = getAuthAccountsSnapshot().find((item) => item.id === accountId);
   if (!account || !account.temporaryKey) return;
   const previousState = temporaryTokenStates[accountId] || {};
   temporaryTokenStates[accountId] = {
@@ -137,6 +172,18 @@ function setServerRunning(nextRunning) {
   return vp.stopServer();
 }
 
+function getServerRunningSnapshot(options = {}) {
+  if (options.refresh || serverRunningCache == null) {
+    serverRunningCache = !!vp.isServerRunning();
+  }
+  return serverRunningCache;
+}
+
+function handleServerStatusChanged(event, payload = {}) {
+  serverRunningCache = !!payload.running;
+  updateServerStatus();
+}
+
 function toggleTokenAccountExpand(statsKey) {
   if (!statsKey) return;
   if (expandedTokenAccounts.has(statsKey)) {
@@ -167,19 +214,56 @@ function toggleAccountDetails(accountId) {
   queryDefaultUsageForVisibleAccounts();
 }
 
-function expandAndQueryAllCodexAccounts() {
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function queryCodexUsageBatch(accounts) {
+  const targets = accounts.filter((account) => account && account.id && !(usageStates[account.id] && usageStates[account.id].loading));
+  if (targets.length === 0) return;
+
+  for (const account of targets) {
+    const previousState = usageStates[account.id] || {};
+    usageStates[account.id] = {
+      loading: true,
+      usage: previousState.usage || null,
+      error: null,
+      details: null
+    };
+  }
+  renderServices();
+
+  let cursor = 0;
+  const workerCount = Math.min(CODEX_USAGE_QUERY_CONCURRENCY, targets.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (cursor < targets.length) {
+      const account = targets[cursor++];
+      await queryCodexUsage(account.id, { deferStartRender: true, deferEndRender: true });
+      scheduleServicesRender();
+      if (cursor < targets.length) {
+        await delay(CODEX_USAGE_QUERY_STAGGER_MS);
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  if (servicesRenderTimer) {
+    clearTimeout(servicesRenderTimer);
+    servicesRenderTimer = null;
+  }
+  renderServices();
+}
+
+async function expandAndQueryAllCodexAccounts() {
   if (!vp.getAuthAccounts) return;
-  const accounts = vp.getAuthAccounts().filter((account) => account.type === 'codex');
+  const accounts = getAuthAccountsSnapshot().filter((account) => account.type === 'codex');
   if (accounts.length === 0) return;
   expanded.add('codex');
   for (const account of accounts) {
     expandedUsage.add(account.id);
     accountDetailTabs[account.id] = 'usage';
   }
-  renderServices();
-  for (const account of accounts) {
-    queryCodexUsage(account.id);
-  }
+  await queryCodexUsageBatch(accounts);
 }
 
 function renderTokenStatsPanel() {
@@ -230,10 +314,29 @@ function setTokenStatsDailyPage(page) {
   renderTokenStatsPanel();
 }
 
-function rerenderPanels() {
+function rerenderPanels(options = {}) {
+  if (options.invalidateAccounts) {
+    invalidateAuthAccountsSnapshot();
+  }
   renderServices();
   renderTokenStatsPanel();
   queryDefaultUsageForVisibleAccounts();
+}
+
+function loadTokenStatsSnapshot(options = {}) {
+  if (!vp.getTokenStatistics) return Promise.resolve(null);
+  return Promise.resolve()
+    .then(() => vp.getTokenStatistics())
+    .then((result) => {
+      if (result && result.success) {
+        tokenStatsState = { loading: false, error: null, stats: result.stats };
+        if (options.rerender !== false) {
+          rerenderPanels();
+        }
+      }
+      return result;
+    })
+    .catch(() => null);
 }
 
 async function refreshTokenStatsPage() {
@@ -265,6 +368,7 @@ const {
   toggleUsageExpand,
   toggleAccountDisabled,
   designateAccountForUse,
+  setAccountPriority,
   queryCodexUsage,
   switchCodexAccount,
   startAddAccountFlow,
@@ -275,6 +379,8 @@ const {
   vp,
   shell,
   services: SERVICES,
+  getAccounts: getAuthAccountsSnapshot,
+  getTokenStats: getTokenStatsSnapshot,
   t,
   escapeHtml,
   sanitizeForAttribute,
@@ -297,7 +403,7 @@ const {
   resetTemporaryTokenStats: (accountId) => vp.resetTemporaryTokenStatsForAccount
     ? vp.resetTemporaryTokenStatsForAccount(accountId)
     : (vp.resetTemporaryTokenStats ? vp.resetTemporaryTokenStats(accountId) : { success: false, error: t('common.error') }),
-  rerender: rerenderPanels
+  rerender: (options = {}) => rerenderPanels({ invalidateAccounts: options.invalidateAccounts !== false })
 });
 
 const fs = require('fs');
@@ -311,19 +417,17 @@ updateLaunchAtLogin();
 document.getElementById('openDashboardBtn').addEventListener('click', () => {
   vp.openDashboard();
 });
-if (vp.getTokenStatistics) {
-  vp.getTokenStatistics().then((result) => {
-    if (result && result.success) {
-      tokenStatsState = { loading: false, error: null, stats: result.stats };
-      rerenderPanels();
-    }
-  }).catch(() => {});
+loadTokenStatsSnapshot();
+if (ipcRenderer && ipcRenderer.on) {
+  ipcRenderer.on('server-status-changed', handleServerStatusChanged);
 }
-setInterval(updateUI, 3000);
+setInterval(refreshLiveStatusFallback, LIVE_STATUS_FALLBACK_INTERVAL_MS);
 
 try {
   if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
-  fs.watch(authDir, { persistent: false }, () => setTimeout(rerenderPanels, 500));
+  fs.watch(authDir, { persistent: false }, () => setTimeout(() => {
+    rerenderPanels({ invalidateAccounts: true });
+  }, 500));
 } catch (e) {}
 
 function setLanguage(language) {
@@ -355,7 +459,7 @@ function applyLanguage() {
   document.getElementById('tokensHeader').textContent = t('tokenStats.title');
   document.getElementById('aboutPanelTitle').textContent = t('static.aboutPanel');
   document.getElementById('serverStatusLabel').textContent = t('static.serverStatus');
-  document.getElementById('serverStatusText').textContent = vp.isServerRunning() ? t('common.running') : t('common.stopped');
+  document.getElementById('serverStatusText').textContent = getServerRunningSnapshot() ? t('common.running') : t('common.stopped');
   document.getElementById('dashboardLabel').textContent = t('static.dashboard');
   document.getElementById('openDashboardBtn').textContent = t('static.openDashboard');
   document.getElementById('languageLabel').textContent = t('static.language');
@@ -400,9 +504,18 @@ function setActiveSection(section) {
 }
 
 function updateUI() {
+  updateLiveStatusUI();
+  rerenderPanels();
+}
+
+function updateLiveStatusUI() {
   updateServerStatus();
   updateProxyUI();
-  rerenderPanels();
+}
+
+function refreshLiveStatusFallback() {
+  getServerRunningSnapshot({ refresh: true });
+  updateLiveStatusUI();
 }
 
 function updateLaunchAtLogin() {
@@ -497,7 +610,7 @@ function resetAccountTokenStates() {
 }
 
 function updateServerStatus() {
-  const running = vp.isServerRunning();
+  const running = getServerRunningSnapshot();
   const statusText = document.getElementById('serverStatusText');
   const toggle = document.getElementById('serverToggle');
   const spinner = document.getElementById('serverStatusSpinner');
@@ -514,10 +627,11 @@ async function toggleServerStatus() {
   serverStatusLoading = true;
   updateServerStatus();
   try {
-    await setServerRunning(!vp.isServerRunning());
+    await setServerRunning(!getServerRunningSnapshot({ refresh: true }));
   } finally {
     setTimeout(() => {
       serverStatusLoading = false;
+      getServerRunningSnapshot({ refresh: true });
       updateServerStatus();
     }, 500);
   }
@@ -547,6 +661,7 @@ Object.assign(window, {
   toggleExpand,
   toggleAccountDisabled,
   designateAccountForUse,
+  setAccountPriority,
   switchCodexAccount,
   expandAndQueryAllCodexAccounts,
   queryCodexUsage,
@@ -571,5 +686,11 @@ document.addEventListener('click', (event) => {
   if (event.target.tagName === 'A' && event.target.href.startsWith('http')) {
     event.preventDefault();
     shell.openExternal(event.target.href);
+  }
+});
+
+window.addEventListener('beforeunload', () => {
+  if (ipcRenderer && ipcRenderer.removeListener) {
+    ipcRenderer.removeListener('server-status-changed', handleServerStatusChanged);
   }
 });

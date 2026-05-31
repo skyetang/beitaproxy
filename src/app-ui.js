@@ -69,6 +69,12 @@ function createAppUiController({
     shell.openExternal(`http://localhost:${backendPort}/management.html`);
   }
 
+  function sendSettingsEvent(channel, payload) {
+    if (!settingsWindow || settingsWindow.isDestroyed()) return false;
+    settingsWindow.webContents.send(channel, payload);
+    return true;
+  }
+
   function openSettings() {
     if (settingsWindow) {
       settingsWindow.setMinimumSize(SETTINGS_WINDOW_MIN_WIDTH, SETTINGS_WINDOW_MIN_HEIGHT);
@@ -77,6 +83,11 @@ function createAppUiController({
       if (settingsWindow.isMinimized()) settingsWindow.restore();
       settingsWindow.show();
       settingsWindow.focus();
+      sendSettingsEvent('server-status-changed', {
+        running: isServerRunning(),
+        reason: 'settings-focused',
+        timestamp: new Date().toISOString()
+      });
       return;
     }
 
@@ -97,6 +108,13 @@ function createAppUiController({
 
     remoteMain.enable(settingsWindow.webContents);
     settingsWindow.loadFile(path.join(__dirname, '../ui/settings.html'));
+    settingsWindow.webContents.once('did-finish-load', () => {
+      sendSettingsEvent('server-status-changed', {
+        running: isServerRunning(),
+        reason: 'settings-loaded',
+        timestamp: new Date().toISOString()
+      });
+    });
     settingsWindow.once('ready-to-show', () => {
       settingsWindow.show();
       settingsWindow.focus();
@@ -171,7 +189,8 @@ function createAppUiController({
     createTray,
     updateTray,
     openDashboard,
-    openSettings
+    openSettings,
+    sendSettingsEvent
   };
 }
 

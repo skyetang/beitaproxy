@@ -223,6 +223,7 @@ button.danger { background: transparent; color: var(--red); }
 /* Accounts */
 .accounts-summary {
   display: flex; align-items: center; gap: 6px;
+  flex-wrap: wrap;
   padding: 8px 0 0 50px;
   font-size: 12px; color: var(--green);
   cursor: pointer;
@@ -261,6 +262,23 @@ button.danger { background: transparent; color: var(--red); }
 .account-email.designated {
   color: var(--green);
   font-weight: 600;
+}
+.account-priority-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.account-priority-control input {
+  width: 64px;
+  height: 24px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: 12px;
 }
 .account-actions {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
