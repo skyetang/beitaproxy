@@ -32,9 +32,14 @@ function createServicesController({
     return getAccountsSnapshot ? getAccountsSnapshot() : vp.getAuthAccounts();
   }
 
-  function getVisibleServices(accounts) {
-    const connectedTypes = new Set(accounts.map((account) => account.type));
-    return services.filter((service) => connectedTypes.has(service.type));
+  function groupAccountsByType(accounts) {
+    const grouped = new Map();
+    for (const account of accounts) {
+      const group = grouped.get(account.type) || [];
+      group.push(account);
+      grouped.set(account.type, group);
+    }
+    return grouped;
   }
 
   function getProviderPickerOptions() {
@@ -137,7 +142,8 @@ function createServicesController({
 
   function renderServices() {
     const accounts = getAccounts();
-    const visibleServices = getVisibleServices(accounts);
+    const accountsByType = groupAccountsByType(accounts);
+    const visibleServices = services.filter((service) => accountsByType.has(service.type));
     const tokenStatsResult = getTokenStatsSnapshot
       ? getTokenStatsSnapshot()
       : (vp.getTokenStatistics ? vp.getTokenStatistics() : { success: false });
@@ -153,7 +159,7 @@ function createServicesController({
 
     const chunks = [];
     for (const svc of visibleServices) {
-      const svcAccounts = accounts.filter((account) => account.type === svc.type);
+      const svcAccounts = accountsByType.get(svc.type) || [];
       const enabled = vp.isProviderEnabled(svc.type);
       const isExpanded = expanded.has(svc.type);
 
@@ -173,9 +179,6 @@ function createServicesController({
 
       if (svcAccounts.length > 0) {
         const enabledAccountCount = svcAccounts.filter((account) => !account.disabled).length;
-        const designatedAccountId = enabledAccountCount === 1
-          ? (svcAccounts.find((account) => !account.disabled) || {}).id
-          : null;
         const showRoundRobin = enabledAccountCount > 1;
         const meta = showRoundRobin
           ? `<span class="meta">• ${escapeHtml(t('services.roundRobin'))}</span>`
@@ -191,18 +194,14 @@ function createServicesController({
 
         for (const account of svcAccounts) {
           const safeId = sanitizeForAttribute(account.id);
-          const detailTab = account.type === 'codex' ? getAccountDetailTab(account.id) : 'tokens';
+          const detailTab = account.type === 'codex' ? getAccountDetailTab(account.id, account) : 'tokens';
           const temporaryStats = temporaryTokenStates[account.id] || { loading: false, error: null, stats: account.temporaryKey ? (temporaryStatsMap[account.temporaryKey] || {}) : {} };
           const canToggleDisabled = svcAccounts.length > 1;
           const disableBlocked = !account.disabled && enabledAccountCount <= 1;
           const dotClass = account.disabled ? 'gray' : (account.expired ? 'orange' : 'green');
           const isDetailExpanded = expandedUsage.has(account.id);
-          const isDesignated = designatedAccountId === account.id;
           const priority = Number.isFinite(Number(account.priority)) ? Math.max(0, Math.round(Number(account.priority))) : 0;
           const labelParts = [];
-          if (isDesignated) {
-            labelParts.push(t('services.designatedAccount'));
-          }
           if (account.expired && !account.disabled) {
             labelParts.push(t('services.expired'));
           }
@@ -211,17 +210,16 @@ function createServicesController({
           }
           const suffix = labelParts.length ? ` (${labelParts.join(', ')})` : '';
           html += `
-            <div class="account-item ${isDetailExpanded ? 'expanded' : 'collapsed'} ${isDesignated ? 'designated' : ''}">
+            <div class="account-item ${isDetailExpanded ? 'expanded' : 'collapsed'}">
               <div class="account-line account-line-with-actions">
-                <span class="dot ${isDesignated ? 'green' : dotClass}"></span>
-                <span class="account-email ${account.expired ? 'expired' : ''} ${account.disabled ? 'disabled' : ''} ${isDesignated ? 'designated' : ''}">${escapeHtml(account.email)}${escapeHtml(suffix)}</span>
-                <label class="account-priority-control" title="${escapeHtml(t('services.priorityHint'))}">
-                  <span>${escapeHtml(t('services.priority'))}</span>
-                  <input type="number" min="0" max="9999" step="1" value="${priority}" onchange="setAccountPriority('${safeId}', this.value)" onclick="event.stopPropagation()">
-                </label>
+                <span class="dot ${dotClass}"></span>
+                <span class="account-email ${account.expired ? 'expired' : ''} ${account.disabled ? 'disabled' : ''}">${escapeHtml(account.email)}${escapeHtml(suffix)}</span>
                 <div class="account-actions inline">
                   <button class="plain account-expand-btn account-action-btn" onclick="toggleAccountDetails('${safeId}')">${isDetailExpanded ? t('usage.collapse') : t('usage.expand')}</button>
-                  <button class="account-action-btn ${isDesignated ? 'account-designated-btn' : 'secondary account-designate-btn'}" ${isDesignated ? 'disabled' : ''} onclick="designateAccountForUse('${safeId}')">${isDesignated ? t('services.designated') : t('services.designate')}</button>
+                  <label class="account-priority-control" title="${escapeHtml(t('services.priorityHint'))}">
+                    <span>${escapeHtml(t('services.priority'))}</span>
+                    <input type="number" min="0" max="9999" step="1" value="${priority}" onchange="setAccountPriority('${safeId}', this.value)" onclick="event.stopPropagation()">
+                  </label>
                   ${account.type === 'codex'
                     ? `<button class="account-action-btn secondary" onclick="switchCodexAccount('${safeId}')">${t('codex.switchLocalAuth')}</button>`
                     : ''}
@@ -304,20 +302,6 @@ function createServicesController({
       rerender();
     } catch (e) {
       showAlert(t('common.error'), e.message || t('services.toggleFailed'));
-    }
-  }
-
-  async function designateAccountForUse(id) {
-    try {
-      const result = vp.designateAccountForUse ? vp.designateAccountForUse(id) : { success: false, error: t('services.designateFailed') };
-      if (!result || !result.success) {
-        showAlert(t('common.error'), (result && result.error) || t('services.designateFailed'));
-        return;
-      }
-      rerender();
-      showAlert(t('common.success'), t('services.accountDesignated'));
-    } catch (e) {
-      showAlert(t('common.error'), e.message || t('services.designateFailed'));
     }
   }
 
@@ -667,7 +651,6 @@ function createServicesController({
     toggleExpand,
     toggleUsageExpand,
     toggleAccountDisabled,
-    designateAccountForUse,
     setAccountPriority,
     queryCodexUsage,
     switchCodexAccount,

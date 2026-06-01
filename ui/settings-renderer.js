@@ -29,6 +29,11 @@ let currentLanguage = (vp.getLanguagePreference ? vp.getLanguagePreference() : l
 let serverRunningCache = null;
 let authAccountsCache = null;
 let servicesRenderTimer = null;
+let authFilesRenderTimer = null;
+let tokenStatsLoadPromise = null;
+let tokenStatsBackgroundRefreshTimer = null;
+let tokenStatsBackgroundRefreshInFlight = false;
+let codexUsageBatchPromise = null;
 const usageStates = {};
 const temporaryTokenStates = {};
 const accountDetailTabs = {};
@@ -75,6 +80,38 @@ function getTokenStatsSnapshot() {
     : { success: false };
 }
 
+function getTemporaryTokenStatsFromSnapshot(account, statsPayload) {
+  if (!account || !account.temporaryKey) return createEmptyTokenStats();
+  return statsPayload && statsPayload.temporaryAccounts
+    ? (statsPayload.temporaryAccounts[account.temporaryKey] || createEmptyTokenStats())
+    : createEmptyTokenStats();
+}
+
+function applyTemporaryTokenStatsSnapshot(account, statsPayload) {
+  if (!account || !account.id) return;
+  temporaryTokenStates[account.id] = {
+    loading: false,
+    error: null,
+    stats: getTemporaryTokenStatsFromSnapshot(account, statsPayload)
+  };
+}
+
+function updateTemporaryTokenStatesFromSnapshot(statsPayload, options = {}) {
+  const targetAccountId = options.accountId ? String(options.accountId) : null;
+  let updated = false;
+  for (const account of getAuthAccountsSnapshot()) {
+    if (!account || !account.temporaryKey) continue;
+    if (targetAccountId) {
+      if (account.id !== targetAccountId) continue;
+    } else if (!expandedUsage.has(account.id) || getAccountDetailTab(account.id, account) !== 'tokens') {
+      continue;
+    }
+    applyTemporaryTokenStatsSnapshot(account, statsPayload);
+    updated = true;
+  }
+  return updated;
+}
+
 function scheduleServicesRender(delayMs = 80) {
   if (servicesRenderTimer) return;
   servicesRenderTimer = setTimeout(() => {
@@ -83,8 +120,8 @@ function scheduleServicesRender(delayMs = 80) {
   }, delayMs);
 }
 
-function getAccountDetailTab(accountId) {
-  const account = getAccountById(accountId);
+function getAccountDetailTab(accountId, account = null) {
+  account = account || getAccountById(accountId);
   if (account && account.type !== 'codex') return 'tokens';
   return accountDetailTabs[accountId] === 'tokens' ? 'tokens' : 'usage';
 }
@@ -95,7 +132,7 @@ function queryDefaultUsageForVisibleAccounts() {
   const pendingAccounts = [];
   for (const account of accounts) {
     if (!expandedUsage.has(account.id)) continue;
-    if (getAccountDetailTab(account.id) === 'usage' && account.type === 'codex') {
+    if (getAccountDetailTab(account.id, account) === 'usage' && account.type === 'codex') {
       const state = usageStates[account.id];
       if (!state || (!state.loading && !state.usage && !state.error)) {
         pendingAccounts.push(account);
@@ -111,6 +148,14 @@ async function refreshTemporaryTokenState(accountId) {
   if (!accountId || !vp.getAuthAccounts || !vp.getTokenStatistics) return;
   const account = getAuthAccountsSnapshot().find((item) => item.id === accountId);
   if (!account || !account.temporaryKey) return;
+
+  if (tokenStatsState.stats) {
+    applyTemporaryTokenStatsSnapshot(account, tokenStatsState.stats);
+    renderServices();
+    scheduleTokenStatsBackgroundRefresh({ rerender: false, accountId });
+    return;
+  }
+
   const previousState = temporaryTokenStates[accountId] || {};
   temporaryTokenStates[accountId] = {
     loading: true,
@@ -120,14 +165,13 @@ async function refreshTemporaryTokenState(accountId) {
   renderServices();
   await new Promise((resolve) => setTimeout(resolve, 0));
   try {
-    const result = await (vp.refreshTokenStatistics ? vp.refreshTokenStatistics() : vp.getTokenStatistics());
+    const result = await loadTokenStatsSnapshot({ force: true, rerender: false });
     if (result && result.success && result.stats) {
-      tokenStatsState = { loading: false, error: null, stats: result.stats };
+      applyTemporaryTokenStatsSnapshot(account, result.stats);
+    } else {
+      temporaryTokenStates[accountId] = { loading: false, error: null, stats: createEmptyTokenStats() };
     }
-    const stats = result && result.success && result.stats && result.stats.temporaryAccounts
-      ? (result.stats.temporaryAccounts[account.temporaryKey] || createEmptyTokenStats())
-      : createEmptyTokenStats();
-    temporaryTokenStates[accountId] = { loading: false, error: null, stats };
+    scheduleTokenStatsBackgroundRefresh({ rerender: false, accountId });
   } catch (e) {
     temporaryTokenStates[accountId] = {
       loading: false,
@@ -207,7 +251,7 @@ function toggleAccountDetails(accountId) {
     }
   }
   renderServices();
-  if (!wasExpanded && getAccountDetailTab(accountId) === 'tokens') {
+  if (!wasExpanded && getAccountDetailTab(accountId, account) === 'tokens') {
     refreshTemporaryTokenState(accountId);
     return;
   }
@@ -219,6 +263,14 @@ function delay(ms) {
 }
 
 async function queryCodexUsageBatch(accounts) {
+  if (codexUsageBatchPromise) return codexUsageBatchPromise;
+  codexUsageBatchPromise = runCodexUsageBatch(accounts).finally(() => {
+    codexUsageBatchPromise = null;
+  });
+  return codexUsageBatchPromise;
+}
+
+async function runCodexUsageBatch(accounts) {
   const targets = accounts.filter((account) => account && account.id && !(usageStates[account.id] && usageStates[account.id].loading));
   if (targets.length === 0) return;
 
@@ -325,7 +377,12 @@ function rerenderPanels(options = {}) {
 
 function loadTokenStatsSnapshot(options = {}) {
   if (!vp.getTokenStatistics) return Promise.resolve(null);
-  return Promise.resolve()
+  if (!options.force && tokenStatsState.stats) {
+    return Promise.resolve({ success: true, stats: tokenStatsState.stats, cached: true });
+  }
+  if (tokenStatsLoadPromise) return tokenStatsLoadPromise;
+
+  tokenStatsLoadPromise = Promise.resolve()
     .then(() => vp.getTokenStatistics())
     .then((result) => {
       if (result && result.success) {
@@ -336,7 +393,43 @@ function loadTokenStatsSnapshot(options = {}) {
       }
       return result;
     })
-    .catch(() => null);
+    .catch(() => null)
+    .finally(() => {
+      tokenStatsLoadPromise = null;
+    });
+  return tokenStatsLoadPromise;
+}
+
+function scheduleTokenStatsBackgroundRefresh(options = {}) {
+  if (tokenStatsBackgroundRefreshTimer || tokenStatsBackgroundRefreshInFlight) return;
+  const delayMs = Number.isFinite(Number(options.delayMs)) ? Math.max(0, Number(options.delayMs)) : 800;
+  tokenStatsBackgroundRefreshTimer = setTimeout(async () => {
+    tokenStatsBackgroundRefreshTimer = null;
+    tokenStatsBackgroundRefreshInFlight = true;
+    try {
+      let result = null;
+      if (vp.scheduleTokenStatisticsRefresh) {
+        await vp.scheduleTokenStatisticsRefresh();
+        result = await loadTokenStatsSnapshot({ force: true, rerender: false });
+      } else if (vp.refreshTokenStatistics) {
+        result = await vp.refreshTokenStatistics();
+        if (result && result.success) {
+          tokenStatsState = { loading: false, error: null, stats: result.stats };
+        }
+      }
+      if (result && result.success && result.stats) {
+        const temporaryUpdated = updateTemporaryTokenStatesFromSnapshot(result.stats, { accountId: options.accountId });
+        if (options.rerender !== false) {
+          rerenderPanels();
+        } else if (temporaryUpdated) {
+          renderServices();
+        }
+      }
+    } catch (e) {
+    } finally {
+      tokenStatsBackgroundRefreshInFlight = false;
+    }
+  }, delayMs);
 }
 
 async function refreshTokenStatsPage() {
@@ -356,8 +449,14 @@ async function refreshTokenStatsPage() {
 function ensureTokenStatsLoaded() {
   const hasStats = tokenStatsState && tokenStatsState.stats;
   if (!tokenStatsState.loading && !hasStats) {
-    refreshTokenStatsPage();
+    tokenStatsState = { ...tokenStatsState, loading: true, error: null };
+    renderTokenStatsPanel();
+    loadTokenStatsSnapshot({ force: true }).then(() => {
+      scheduleTokenStatsBackgroundRefresh({ delayMs: 600, rerender: activeSection === 'tokens' });
+    });
+    return;
   }
+  scheduleTokenStatsBackgroundRefresh({ delayMs: 1000, rerender: activeSection === 'tokens' });
 }
 
 const {
@@ -367,7 +466,6 @@ const {
   toggleExpand,
   toggleUsageExpand,
   toggleAccountDisabled,
-  designateAccountForUse,
   setAccountPriority,
   queryCodexUsage,
   switchCodexAccount,
@@ -425,9 +523,15 @@ setInterval(refreshLiveStatusFallback, LIVE_STATUS_FALLBACK_INTERVAL_MS);
 
 try {
   if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
-  fs.watch(authDir, { persistent: false }, () => setTimeout(() => {
-    rerenderPanels({ invalidateAccounts: true });
-  }, 500));
+  fs.watch(authDir, { persistent: false }, () => {
+    if (authFilesRenderTimer) {
+      clearTimeout(authFilesRenderTimer);
+    }
+    authFilesRenderTimer = setTimeout(() => {
+      authFilesRenderTimer = null;
+      rerenderPanels({ invalidateAccounts: true });
+    }, 500);
+  });
 } catch (e) {}
 
 function setLanguage(language) {
@@ -660,7 +764,6 @@ Object.assign(window, {
   toggleProvider,
   toggleExpand,
   toggleAccountDisabled,
-  designateAccountForUse,
   setAccountPriority,
   switchCodexAccount,
   expandAndQueryAllCodexAccounts,

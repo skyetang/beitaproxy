@@ -1,9 +1,9 @@
 const { BrowserWindow, Tray, Menu, nativeImage, clipboard, Notification, shell } = require('electron');
 const path = require('path');
 
-const SETTINGS_WINDOW_WIDTH = 800;
+const SETTINGS_WINDOW_WIDTH = 980;
 const SETTINGS_WINDOW_HEIGHT = 600;
-const SETTINGS_WINDOW_MIN_WIDTH = 600;
+const SETTINGS_WINDOW_MIN_WIDTH = 760;
 const SETTINGS_WINDOW_MIN_HEIGHT = 450;
 
 function createTrayIcon(iconPath) {

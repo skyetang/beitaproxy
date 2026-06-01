@@ -23,7 +23,7 @@ body {
   -webkit-app-region: drag;
   padding-top: 28px;
   height: 100vh;
-  overflow: auto;
+  overflow: hidden;
 }
 .container {
   -webkit-app-region: no-drag;
@@ -81,8 +81,11 @@ body {
 .content-panel {
   display: none;
   height: 100%;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   padding-right: 4px;
+  scrollbar-gutter: stable;
 }
 .content-panel.active { display: block; }
 .content-panel .section:last-child { margin-bottom: 0; }
@@ -211,7 +214,12 @@ button.danger { background: transparent; color: var(--red); }
 }
 
 /* Service rows */
-.service-row { padding: 12px 0; border-bottom: 0.5px solid var(--border); }
+.service-row {
+  padding: 12px 0;
+  border-bottom: 0.5px solid var(--border);
+  content-visibility: auto;
+  contain-intrinsic-size: 96px;
+}
 .service-row:last-child { border-bottom: none; }
 .service-header { display: flex; align-items: center; gap: 10px; }
 .service-icon { width: 24px; height: 24px; border-radius: 6px; }
@@ -237,6 +245,11 @@ button.danger { background: transparent; color: var(--red); }
 .account-item {
   display: flex; flex-direction: column; gap: 8px;
   padding: 12px 0; font-size: 12px;
+  content-visibility: auto;
+  contain-intrinsic-size: 52px;
+}
+.account-item.expanded {
+  contain-intrinsic-size: 220px;
 }
 .account-item + .account-item {
   margin-top: 8px;
@@ -258,10 +271,6 @@ button.danger { background: transparent; color: var(--red); }
   color: var(--text-secondary);
   opacity: 0.55;
   text-decoration: line-through;
-}
-.account-email.designated {
-  color: var(--green);
-  font-weight: 600;
 }
 .account-priority-control {
   display: inline-flex;
@@ -302,14 +311,6 @@ button.danger { background: transparent; color: var(--red); }
   opacity: 1;
   background: #93ffae;
 }
-.account-designate-btn {
-  color: var(--text-primary);
-}
-.account-designated-btn {
-  background: var(--green);
-  color: #0b1f11;
-  cursor: default;
-}
 .account-disable-btn {
   background: rgba(255,255,255,0.08);
   color: var(--orange);
@@ -319,10 +320,6 @@ button.danger { background: transparent; color: var(--red); }
 }
 .provider-inline-btn {
   margin-left: 2px;
-}
-.account-item.designated {
-  border-left: 2px solid var(--green);
-  padding-left: 8px;
 }
 .account-item.collapsed .usage-card {
   display: none;
@@ -335,6 +332,7 @@ button.danger { background: transparent; color: var(--red); }
   display: flex;
   flex-direction: column;
   gap: 6px;
+  contain: layout paint style;
 }
 .usage-card-shell {
   position: relative;
@@ -349,7 +347,6 @@ button.danger { background: transparent; color: var(--red); }
   gap: 8px;
   border-radius: 8px;
   background: rgba(28, 28, 30, 0.68);
-  backdrop-filter: blur(1px);
 }
 .account-detail-tabs {
   display: inline-flex;

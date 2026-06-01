@@ -47,6 +47,7 @@ const AUTH_COMPLETION_TIMEOUT_MS = 5 * 60 * 1000;
 const AUTH_COMPLETION_POLL_MS = 500;
 const AUTH_PROCESS_EXIT_GRACE_MS = 3000;
 const TOKEN_STATS_BACKGROUND_SYNC_DELAY_MS = 1500;
+const AUTH_ENTRIES_SIGNATURE_TTL_MS = 500;
 
 // State
 let serverProcess = null;
@@ -69,9 +70,15 @@ let tokenStatsSyncActivePromise = null;
 let tokenStatsStoreQueue = Promise.resolve();
 let quitCleanupComplete = false;
 let quitCleanupPromise = null;
+let tokenStatsPayloadCache = {
+  statsSignature: null,
+  authSignature: null,
+  payload: null
+};
 let authEntriesCache = {
   signature: null,
-  entries: null
+  entries: null,
+  checkedAt: 0
 };
 let tokenStatsSqliteState = {
   checked: false,
@@ -236,13 +243,6 @@ function writeAppConfig(config) {
   try { fs.chmodSync(CONFIG_FILE, 0o600); } catch (e) {}
 }
 
-function getSelectedAccounts() {
-  const config = readAppConfig();
-  return config && typeof config.selectedAccounts === 'object' && config.selectedAccounts !== null
-    ? config.selectedAccounts
-    : {};
-}
-
 function ensureParentDir(filePath) {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
@@ -282,7 +282,6 @@ function saveAppSettings() {
     const config = readAppConfig();
     config.launchAtLogin = launchAtLogin;
     config.language = currentLanguage;
-    delete config.selectedAccounts;
     config.localProxyUrl = localProxyUrl;
     writeAppConfig(config);
   } catch (e) {}
@@ -319,8 +318,10 @@ function writeAuthFile(filePath, data) {
 function invalidateAuthEntriesCache() {
   authEntriesCache = {
     signature: null,
-    entries: null
+    entries: null,
+    checkedAt: 0
   };
+  invalidateTokenStatsPayloadCache();
 }
 
 function getAuthEntriesSignature() {
@@ -378,17 +379,33 @@ function readAllAuthAccountEntries() {
 
 function listAuthAccountEntries(serviceType = null) {
   try {
+    const now = Date.now();
+    if (
+      authEntriesCache.entries
+      && authEntriesCache.signature
+      && now - (authEntriesCache.checkedAt || 0) < AUTH_ENTRIES_SIGNATURE_TTL_MS
+    ) {
+      const cachedEntries = authEntriesCache.entries || [];
+      return serviceType
+        ? cachedEntries.filter((entry) => entry.type === serviceType)
+        : cachedEntries;
+    }
+
     const signature = getAuthEntriesSignature();
     if (!authEntriesCache.entries || authEntriesCache.signature !== signature) {
       authEntriesCache = {
         signature,
-        entries: readAllAuthAccountEntries()
+        entries: readAllAuthAccountEntries(),
+        checkedAt: now
       };
+    } else {
+      authEntriesCache.checkedAt = now;
     }
   } catch (e) {
     authEntriesCache = {
       signature: null,
-      entries: readAllAuthAccountEntries()
+      entries: readAllAuthAccountEntries(),
+      checkedAt: Date.now()
     };
   }
 
@@ -1045,37 +1062,6 @@ function toggleAccountDisabled(accountId) {
   }
 }
 
-function designateAccountForUse(accountId) {
-  try {
-    const entry = findAuthAccountEntry(accountId);
-    if (!entry) {
-      return { success: false, error: 'Account not found' };
-    }
-
-    const siblingEntries = listAuthAccountEntries(entry.type);
-    if (siblingEntries.length === 0) {
-      return { success: false, error: 'No accounts found for provider' };
-    }
-
-    for (const sibling of siblingEntries) {
-      sibling.data.disabled = sibling.id === entry.id ? false : true;
-      writeAuthFile(sibling.filePath, sibling.data);
-    }
-
-    getConfigPath();
-    requestRestartAfterConfigChange();
-
-    return {
-      success: true,
-      accountId,
-      type: entry.type,
-      designatedAccountId: entry.id
-    };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
-}
-
 function setAccountPriority(accountId, priority) {
   try {
     const entry = findAuthAccountEntry(accountId);
@@ -1157,7 +1143,7 @@ async function resetTemporaryTokenStats(temporaryKey) {
       };
       store.updatedAt = new Date().toISOString();
       writeTokenStatsStore(store);
-      return { success: true, stats: buildTokenStatisticsPayload(store) };
+      return { success: true, stats: buildCachedTokenStatisticsPayload(store) };
     });
   } catch (e) {
     return { success: false, error: e.message };
@@ -1551,15 +1537,52 @@ function findAccountEntryByAccountId(provider, accountId) {
   }) || null;
 }
 
-function resolveRoundRobinAccountEntry(provider) {
-  const enabledEntries = listAuthAccountEntries(provider).filter((entry) => entry.data.disabled !== true);
-  if (enabledEntries.length === 0) return null;
-  if (enabledEntries.length === 1) return enabledEntries[0];
+function getAuthCooldownUntil(data) {
+  if (!data || typeof data !== 'object') return null;
+  const value = data.cooldown_until
+    || data.cooldownUntil
+    || data.quota_cooldown_until
+    || data.quotaCooldownUntil
+    || data.model_cooldown_until
+    || data.modelCooldownUntil
+    || data.temporary_disabled_until
+    || data.temporaryDisabledUntil
+    || data.unavailable_until
+    || data.unavailableUntil;
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
 
-  const key = String(provider || 'unknown');
+function isAuthAccountEntryReady(entry, nowMs = Date.now()) {
+  const data = entry && entry.data ? entry.data : {};
+  if (data.disabled === true) return false;
+  if (data.available === false || data.ready === false) return false;
+  const cooldownUntil = getAuthCooldownUntil(data);
+  return !cooldownUntil || cooldownUntil.getTime() <= nowMs;
+}
+
+function getHighestPriorityReadyEntries(provider) {
+  const readyEntries = listAuthAccountEntries(provider).filter((entry) => isAuthAccountEntryReady(entry));
+  if (readyEntries.length <= 1) return readyEntries;
+
+  let highestPriority = -Infinity;
+  for (const entry of readyEntries) {
+    highestPriority = Math.max(highestPriority, getAccountPriority(entry.data));
+  }
+  return readyEntries.filter((entry) => getAccountPriority(entry.data) === highestPriority);
+}
+
+function resolveRoundRobinAccountEntry(provider) {
+  const priorityEntries = getHighestPriorityReadyEntries(provider);
+  if (priorityEntries.length === 0) return null;
+  if (priorityEntries.length === 1) return priorityEntries[0];
+
+  const priority = getAccountPriority(priorityEntries[0].data);
+  const key = `${String(provider || 'unknown')}:${priority}`;
   const index = statsAttributionIndexes[key] || 0;
-  const entry = enabledEntries[index % enabledEntries.length];
-  statsAttributionIndexes[key] = (index + 1) % enabledEntries.length;
+  const entry = priorityEntries[index % priorityEntries.length];
+  statsAttributionIndexes[key] = (index + 1) % priorityEntries.length;
   return entry;
 }
 
@@ -1588,15 +1611,6 @@ function resolveAccountEntryForRequest(body, headers = {}) {
   ]) : null;
   const accountMatchedEntry = findAccountEntryByAccountId(provider, headerAccountId || bodyAccountId);
   if (accountMatchedEntry) return accountMatchedEntry;
-
-  const selectedAccounts = getSelectedAccounts();
-  const selectedId = selectedAccounts[provider];
-  if (selectedId) {
-    const selectedEntry = findAuthAccountEntry(selectedId);
-    if (selectedEntry && selectedEntry.type === provider && selectedEntry.data.disabled !== true) {
-      return selectedEntry;
-    }
-  }
 
   return resolveRoundRobinAccountEntry(provider);
 }
@@ -2126,6 +2140,11 @@ function hasTokenBreakdownStats(value) {
 
 function buildTokenStatisticsPayload(store) {
   const currentAccounts = getAuthAccounts();
+  const currentAccountsByStatsKey = new Map(
+    currentAccounts
+      .filter((account) => account && account.statsKey)
+      .map((account) => [account.statsKey, account])
+  );
   const currentStatsById = {};
   const temporaryAccounts = {};
   const historicalAccounts = [];
@@ -2145,7 +2164,7 @@ function buildTokenStatisticsPayload(store) {
 
   for (const statsKey of statsKeys) {
     const meta = store.accountMeta[statsKey] || createEmptyAccountMeta();
-    const activeAccount = currentAccounts.find((account) => account.statsKey === statsKey) || null;
+    const activeAccount = currentAccountsByStatsKey.get(statsKey) || null;
     const provider = meta.provider || (activeAccount && activeAccount.type) || String(statsKey.split('::')[0] || 'unknown');
     const temporaryKey = activeAccount ? activeAccount.temporaryKey : meta.temporaryKey;
     const unattributed = meta.unattributed === true || isUnattributedStatsKey(statsKey);
@@ -2650,6 +2669,68 @@ function closeTokenStatsSqliteDatabase() {
   tokenStatsSqliteState.db = null;
 }
 
+function invalidateTokenStatsPayloadCache() {
+  tokenStatsPayloadCache = {
+    statsSignature: null,
+    authSignature: null,
+    payload: null
+  };
+}
+
+function getTokenStatsStorageSignature() {
+  const files = isTokenStatsSqliteEnabled()
+    ? [TOKEN_STATS_DB_FILE, `${TOKEN_STATS_DB_FILE}-wal`, `${TOKEN_STATS_DB_FILE}-shm`]
+    : [TOKEN_STATS_FILE];
+  const parts = [];
+
+  for (const filePath of files) {
+    try {
+      if (!fs.existsSync(filePath)) {
+        parts.push(`${path.basename(filePath)}:missing`);
+        continue;
+      }
+      const stat = fs.statSync(filePath);
+      parts.push(`${path.basename(filePath)}:${stat.size}:${stat.mtimeMs}`);
+    } catch (e) {
+      parts.push(`${path.basename(filePath)}:error`);
+    }
+  }
+
+  return parts.join('|');
+}
+
+function buildCachedTokenStatisticsPayload(store, options = {}) {
+  const statsSignature = options.statsSignature || getTokenStatsStorageSignature();
+  const authSignature = options.authSignature || getAuthEntriesSignature();
+
+  if (
+    tokenStatsPayloadCache.payload
+    && tokenStatsPayloadCache.statsSignature === statsSignature
+    && tokenStatsPayloadCache.authSignature === authSignature
+  ) {
+    return tokenStatsPayloadCache.payload;
+  }
+
+  const payload = buildTokenStatisticsPayload(store);
+  tokenStatsPayloadCache = {
+    statsSignature,
+    authSignature,
+    payload
+  };
+  return payload;
+}
+
+function getCachedTokenStatisticsPayloadIfFresh(statsSignature, authSignature) {
+  if (
+    tokenStatsPayloadCache.payload
+    && tokenStatsPayloadCache.statsSignature === statsSignature
+    && tokenStatsPayloadCache.authSignature === authSignature
+  ) {
+    return tokenStatsPayloadCache.payload;
+  }
+  return null;
+}
+
 function readTokenStatsStoreFile(filePath) {
   if (!fs.existsSync(filePath)) return null;
   const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -2719,9 +2800,10 @@ function writeTokenStatsStoreJson(store) {
 }
 
 function writeTokenStatsStore(store) {
+  let written = false;
   if (isTokenStatsSqliteEnabled()) {
     try {
-      if (writeTokenStatsStoreSqlite(store)) return;
+      written = writeTokenStatsStoreSqlite(store);
     } catch (e) {
       if (!tokenStatsSqliteState.warned) {
         tokenStatsSqliteState.warned = true;
@@ -2731,7 +2813,10 @@ function writeTokenStatsStore(store) {
       closeTokenStatsSqliteDatabase();
     }
   }
-  writeTokenStatsStoreJson(store);
+  if (!written) {
+    writeTokenStatsStoreJson(store);
+  }
+  invalidateTokenStatsPayloadCache();
 }
 
 function queueTokenStatsStoreUpdate(task) {
@@ -3470,6 +3555,11 @@ function scheduleBackgroundTokenStatsSync() {
   }, TOKEN_STATS_BACKGROUND_SYNC_DELAY_MS);
 }
 
+async function scheduleTokenStatisticsRefresh() {
+  await runBackgroundTokenStatsSync();
+  return { success: true };
+}
+
 async function flushPendingTokenStatsSync() {
   if (tokenStatsSyncTimer) {
     clearTimeout(tokenStatsSyncTimer);
@@ -3500,7 +3590,7 @@ async function refreshTokenStatistics() {
       writeTokenStatsStore(store);
       return {
         success: true,
-        stats: buildTokenStatisticsPayload(store)
+        stats: buildCachedTokenStatisticsPayload(store)
       };
     });
   } catch (e) {
@@ -3510,11 +3600,18 @@ async function refreshTokenStatistics() {
 
 function getTokenStatistics() {
   try {
+    const statsSignature = getTokenStatsStorageSignature();
+    const authSignature = getAuthEntriesSignature();
+    const cachedPayload = getCachedTokenStatisticsPayloadIfFresh(statsSignature, authSignature);
+    if (cachedPayload) {
+      return { success: true, stats: cachedPayload, cached: true };
+    }
+
     const store = readTokenStatsStore();
     ensureTokenStatsAccountMetadata(store);
     return {
       success: true,
-      stats: buildTokenStatisticsPayload(store)
+      stats: buildCachedTokenStatisticsPayload(store, { statsSignature, authSignature })
     };
   } catch (e) {
     return { success: false, error: e.message };
@@ -3529,7 +3626,7 @@ async function resetAllTokenStatistics() {
       writeTokenStatsStore(store);
       return {
         success: true,
-        stats: buildTokenStatisticsPayload(store)
+        stats: buildCachedTokenStatisticsPayload(store)
       };
     });
   } catch (e) {
@@ -4273,7 +4370,6 @@ global.beitaProxy = {
   // Auth
   getAuthAccounts,
   toggleAccountDisabled,
-  designateAccountForUse,
   setAccountPriority,
   deleteAccount,
   checkCodexLocalAuth,
@@ -4285,6 +4381,7 @@ global.beitaProxy = {
   getCodexUsage,
   getTokenStatistics,
   refreshTokenStatistics,
+  scheduleTokenStatisticsRefresh,
   resetTemporaryTokenStats,
   resetTemporaryTokenStatsForAccount,
   resetAllTokenStatistics,
