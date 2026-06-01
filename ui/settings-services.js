@@ -140,7 +140,36 @@ function createServicesController({
     header.appendChild(actions);
   }
 
+  function captureServicesScroll(container) {
+    const scrollElement = container && container.closest
+      ? container.closest('.content-panel')
+      : null;
+    if (!scrollElement) return null;
+    return {
+      element: scrollElement,
+      top: scrollElement.scrollTop,
+      left: scrollElement.scrollLeft
+    };
+  }
+
+  function restoreServicesScroll(snapshot) {
+    if (!snapshot || !snapshot.element) return;
+
+    const restore = () => {
+      const maxTop = Math.max(0, snapshot.element.scrollHeight - snapshot.element.clientHeight);
+      snapshot.element.scrollTop = Math.min(snapshot.top, maxTop);
+      snapshot.element.scrollLeft = snapshot.left;
+    };
+
+    restore();
+    if (typeof window !== 'undefined' && window.requestAnimationFrame) {
+      window.requestAnimationFrame(restore);
+    }
+  }
+
   function renderServices() {
+    const container = document.getElementById('services');
+    const scrollSnapshot = captureServicesScroll(container);
     const accounts = getAccounts();
     const accountsByType = groupAccountsByType(accounts);
     const visibleServices = services.filter((service) => accountsByType.has(service.type));
@@ -150,10 +179,10 @@ function createServicesController({
     const temporaryStatsMap = tokenStatsResult && tokenStatsResult.success && tokenStatsResult.stats && tokenStatsResult.stats.temporaryAccounts
       ? tokenStatsResult.stats.temporaryAccounts
       : {};
-    const container = document.getElementById('services');
 
     if (visibleServices.length === 0) {
       container.innerHTML = `<div class="no-accounts">${escapeHtml(t('services.noAccountsAdded'))}</div>`;
+      restoreServicesScroll(scrollSnapshot);
       return;
     }
 
@@ -257,6 +286,8 @@ function createServicesController({
         }
       });
     });
+
+    restoreServicesScroll(scrollSnapshot);
   }
 
   function toggleProvider(type) {

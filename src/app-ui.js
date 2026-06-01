@@ -75,11 +75,17 @@ function createAppUiController({
     return true;
   }
 
+  function normalizeSettingsWindowLevel() {
+    if (!settingsWindow || settingsWindow.isDestroyed()) return;
+    settingsWindow.setAlwaysOnTop(false);
+    if (process.platform === 'darwin') {
+      settingsWindow.setVisibleOnAllWorkspaces(false);
+    }
+  }
+
   function openSettings() {
     if (settingsWindow) {
-      settingsWindow.setMinimumSize(SETTINGS_WINDOW_MIN_WIDTH, SETTINGS_WINDOW_MIN_HEIGHT);
-      settingsWindow.setSize(SETTINGS_WINDOW_WIDTH, SETTINGS_WINDOW_HEIGHT);
-      settingsWindow.center();
+      normalizeSettingsWindowLevel();
       if (settingsWindow.isMinimized()) settingsWindow.restore();
       settingsWindow.show();
       settingsWindow.focus();
@@ -97,6 +103,9 @@ function createAppUiController({
       minWidth: SETTINGS_WINDOW_MIN_WIDTH,
       minHeight: SETTINGS_WINDOW_MIN_HEIGHT,
       resizable: true,
+      movable: true,
+      focusable: true,
+      alwaysOnTop: false,
       title: 'BeitaProxy',
       titleBarStyle: 'hiddenInset',
       show: false,
@@ -107,6 +116,7 @@ function createAppUiController({
     });
 
     remoteMain.enable(settingsWindow.webContents);
+    normalizeSettingsWindowLevel();
     settingsWindow.loadFile(path.join(__dirname, '../ui/settings.html'));
     settingsWindow.webContents.once('did-finish-load', () => {
       sendSettingsEvent('server-status-changed', {
@@ -116,6 +126,7 @@ function createAppUiController({
       });
     });
     settingsWindow.once('ready-to-show', () => {
+      normalizeSettingsWindowLevel();
       settingsWindow.show();
       settingsWindow.focus();
     });

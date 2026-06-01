@@ -50,6 +50,7 @@ body {
   padding: 6px 10px 10px;
   font-size: 15px;
   font-weight: 600;
+  -webkit-app-region: drag;
 }
 .sidebar-nav {
   display: flex;
@@ -106,6 +107,7 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.5px;
   padding: 16px 16px 8px;
+  -webkit-app-region: drag;
 }
 .section-header-main {
   display: flex;
@@ -118,6 +120,7 @@ body {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+  -webkit-app-region: no-drag;
 }
 .section-header a {
   color: var(--accent);
@@ -161,6 +164,7 @@ button {
   cursor: pointer;
   font-size: 12px;
   font-weight: 500;
+  -webkit-app-region: no-drag;
 }
 button:hover { opacity: 0.9; }
 button:active { opacity: 0.8; }
@@ -195,6 +199,7 @@ button.danger { background: transparent; color: var(--red); }
   cursor: pointer;
   transition: background 0.2s;
   flex-shrink: 0;
+  -webkit-app-region: no-drag;
 }
 .toggle.on { background: var(--green); }
 .toggle::after {
@@ -217,8 +222,6 @@ button.danger { background: transparent; color: var(--red); }
 .service-row {
   padding: 12px 0;
   border-bottom: 0.5px solid var(--border);
-  content-visibility: auto;
-  contain-intrinsic-size: 96px;
 }
 .service-row:last-child { border-bottom: none; }
 .service-header { display: flex; align-items: center; gap: 10px; }
@@ -245,11 +248,6 @@ button.danger { background: transparent; color: var(--red); }
 .account-item {
   display: flex; flex-direction: column; gap: 8px;
   padding: 12px 0; font-size: 12px;
-  content-visibility: auto;
-  contain-intrinsic-size: 52px;
-}
-.account-item.expanded {
-  contain-intrinsic-size: 220px;
 }
 .account-item + .account-item {
   margin-top: 8px;
