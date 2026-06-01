@@ -146,23 +146,19 @@ function createUsageRenderer({
     const secondaryWindow = rateLimit && rateLimit.secondaryWindow;
     const reviewWindow = reviewLimit && reviewLimit.primaryWindow;
     const summaryPills = [];
+    const trailingSummaryPills = [];
     const overallRows = [];
 
     if (usage.planType) {
-      summaryPills.push(renderUsagePill(t('usage.plan'), usage.planType));
+      trailingSummaryPills.push(renderUsagePill(t('usage.plan'), usage.planType));
       overallRows.push(renderUsageRow(t('usage.plan'), escapeHtml(usage.planType)));
     }
 
-    let statusPill = '';
     if (rateLimit) {
       const statusLabel = rateLimit.allowed && !rateLimit.limitReached ? t('common.available') : t('common.blocked');
-      statusPill = renderUsagePill(t('usage.status'), statusLabel, rateLimit.allowed && !rateLimit.limitReached ? 'good' : 'bad');
+      trailingSummaryPills.push(renderUsagePill(t('usage.status'), statusLabel, rateLimit.allowed && !rateLimit.limitReached ? 'good' : 'bad'));
       overallRows.push(renderUsageRow(t('usage.status'), escapeHtml(statusLabel)));
       overallRows.push(renderUsageRow(t('usage.limitReached'), escapeHtml(rateLimit.limitReached ? t('common.yes') : t('common.no'))));
-    }
-
-    if (statusPill) {
-      summaryPills.push(statusPill);
     }
 
     if (primaryWindow && primaryWindow.remainingPercent != null) {
@@ -219,6 +215,8 @@ function createUsageRenderer({
         summaryPills.push(renderUsagePill(t('usage.reviewResetAt'), formatDateText(reviewWindow.resetAt)));
       }
     }
+
+    summaryPills.push(...trailingSummaryPills);
 
     if (overallRows.length === 0 && usage.raw) {
       overallRows.push(renderUsageRow(t('common.unknown'), escapeHtml(JSON.stringify(usage.raw, null, 2).slice(0, 240) || t('usage.noData'))));
